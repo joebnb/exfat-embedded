@@ -1,0 +1,4 @@
+use crate::Error;
+pub trait BlockDevice { type Error; fn sector_size(&self) -> usize; fn sector_count(&self) -> u64; fn read_sector(&mut self, lba: u64, out: &mut [u8]) -> Result<(), Self::Error>; fn write_sector(&mut self, lba: u64, data: &[u8]) -> Result<(), Self::Error>; fn flush(&mut self) -> Result<(), Self::Error>; }
+pub struct Scratch<'a> { pub(crate) bytes: &'a mut [u8] }
+impl<'a> Scratch<'a> { pub fn new(bytes: &'a mut [u8]) -> Self { Self { bytes } } pub fn len(&self) -> usize { self.bytes.len() } pub fn is_empty(&self) -> bool { self.bytes.is_empty() } pub(crate) fn require(&self, size: usize) -> Result<(), Error<core::convert::Infallible>> { if self.bytes.len() < size { Err(Error::InvalidSectorSize) } else { Ok(()) } } pub(crate) fn sector(&mut self, size: usize) -> &mut [u8] { &mut self.bytes[..size] } }
