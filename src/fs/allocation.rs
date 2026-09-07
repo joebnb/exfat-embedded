@@ -9,12 +9,18 @@ impl<D: BlockDevice> FileSystem<D> {
             * u64::from(self.volume.geometry().bytes_per_cluster())
     }
 
-    /// Currently unallocated bytes, maintained as allocation metadata changes.
+    /// Return currently unallocated bytes, scanning the allocation bitmap on
+    /// the first query after mounting.
     ///
-    /// The count is captured while mounting. Call [`Self::refresh_free_space`]
-    /// after another host might have modified removable media directly.
-    pub fn free_space_bytes(&self) -> u64 {
-        u64::from(self.free_clusters) * u64::from(self.volume.geometry().bytes_per_cluster())
+    /// Subsequent calls are O(1), and allocations/releases maintain the
+    /// cached count. Call [`Self::refresh_free_space`] after another host
+    /// might have modified removable media directly.
+    pub fn free_space_bytes(&mut self, scratch: &mut Scratch<'_>) -> Result<u64, Error<D::Error>> {
+        if self.free_clusters.is_none() {
+            self.refresh_free_clusters(scratch)?;
+        }
+        Ok(u64::from(self.free_clusters.ok_or(Error::Corrupt)?)
+            * u64::from(self.volume.geometry().bytes_per_cluster()))
     }
 
     /// Rescan the allocation bitmap and refresh the cached free-space count.
@@ -23,7 +29,7 @@ impl<D: BlockDevice> FileSystem<D> {
         scratch: &mut Scratch<'_>,
     ) -> Result<u64, Error<D::Error>> {
         self.refresh_free_clusters(scratch)?;
-        Ok(self.free_space_bytes())
+        self.free_space_bytes(scratch)
     }
 
     pub(crate) fn refresh_free_clusters(
@@ -68,12 +74,13 @@ impl<D: BlockDevice> FileSystem<D> {
             }
             byte = byte.checked_add(bytes as u64).ok_or(Error::Corrupt)?;
         }
-        self.free_clusters = self
-            .volume
-            .geometry()
-            .cluster_count
-            .checked_sub(used_clusters)
-            .ok_or(Error::Corrupt)?;
+        self.free_clusters = Some(
+            self.volume
+                .geometry()
+                .cluster_count
+                .checked_sub(used_clusters)
+                .ok_or(Error::Corrupt)?,
+        );
         Ok(())
     }
 
@@ -170,13 +177,17 @@ impl<D: BlockDevice> FileSystem<D> {
         if was_used == used {
             return Ok(());
         }
-        let new_free_clusters = if used {
-            self.free_clusters.checked_sub(1).ok_or(Error::Corrupt)?
-        } else {
-            self.free_clusters
-                .checked_add(1)
-                .filter(|count| *count <= self.volume.geometry().cluster_count)
-                .ok_or(Error::Corrupt)?
+        let new_free_clusters = match self.free_clusters {
+            Some(free_clusters) if used => {
+                Some(free_clusters.checked_sub(1).ok_or(Error::Corrupt)?)
+            }
+            Some(free_clusters) => Some(
+                free_clusters
+                    .checked_add(1)
+                    .filter(|count| *count <= self.volume.geometry().cluster_count)
+                    .ok_or(Error::Corrupt)?,
+            ),
+            None => None,
         };
         if used {
             scratch.sector(size)[offset] |= 1 << bit;

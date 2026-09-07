@@ -6,13 +6,11 @@ impl<D: BlockDevice> FileSystem<D> {
     /// Mount `device`, retaining it as this filesystem's exclusive backend.
     pub fn mount(mut device: D, scratch: &mut Scratch<'_>) -> Result<Self, Error<D::Error>> {
         let volume = Volume::mount(&mut device, scratch)?;
-        let mut filesystem = Self {
+        Ok(Self {
             device,
             volume,
-            free_clusters: 0,
-        };
-        filesystem.refresh_free_clusters(scratch)?;
-        Ok(filesystem)
+            free_clusters: None,
+        })
     }
 
     /// Mount `device`, returning it on failure so removable media can be
@@ -23,17 +21,11 @@ impl<D: BlockDevice> FileSystem<D> {
         scratch: &mut Scratch<'_>,
     ) -> Result<Self, (D, Error<D::Error>)> {
         match Volume::mount(&mut device, scratch) {
-            Ok(volume) => {
-                let mut filesystem = Self {
-                    device,
-                    volume,
-                    free_clusters: 0,
-                };
-                match filesystem.refresh_free_clusters(scratch) {
-                    Ok(()) => Ok(filesystem),
-                    Err(error) => Err((filesystem.device, error)),
-                }
-            }
+            Ok(volume) => Ok(Self {
+                device,
+                volume,
+                free_clusters: None,
+            }),
             Err(error) => Err((device, error)),
         }
     }

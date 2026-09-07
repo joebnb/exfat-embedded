@@ -15,5 +15,7 @@ pub use file::File;
 pub struct FileSystem<D> {
     pub(crate) device: D,
     pub(crate) volume: Volume,
-    pub(crate) free_clusters: u32,
+    // Discovered only if free space is queried. Keeping this lazy avoids a
+    // whole-bitmap scan on the mount path used by the interactive browser.
+    pub(crate) free_clusters: Option<u32>,
 }
