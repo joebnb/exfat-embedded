@@ -3,9 +3,9 @@
 use super::{EntryLocator, File};
 use crate::directory::EntrySet;
 use crate::directory::codec::{entry_set_checksum_step, utf8_to_utf16};
-use crate::{
-    BlockDevice, Directory, DirectoryEntry, Error, FileSystem, Geometry, Scratch, Volume, Workspace,
-};
+use crate::{BlockDevice, Directory, DirectoryEntry, Error, FileSystem, Scratch, Workspace};
+
+mod mount;
 
 struct NewEntrySet<'a> {
     name: &'a [u16],
@@ -16,45 +16,6 @@ struct NewEntrySet<'a> {
 }
 
 impl<D: BlockDevice> FileSystem<D> {
-    /// Mount `device`, retaining it as this filesystem's exclusive backend.
-    pub fn mount(mut device: D, scratch: &mut Scratch<'_>) -> Result<Self, Error<D::Error>> {
-        let volume = Volume::mount(&mut device, scratch)?;
-        Ok(Self { device, volume })
-    }
-
-    /// Mount `device`, returning it on failure.
-    ///
-    /// This variant is useful for removable media: a failed boot-sector read
-    /// must not consume the caller's transport, because it may need to probe
-    /// again after the card is reinserted.
-    #[inline(never)]
-    pub fn mount_recoverable(
-        mut device: D,
-        scratch: &mut Scratch<'_>,
-    ) -> Result<Self, (D, Error<D::Error>)> {
-        match Volume::mount(&mut device, scratch) {
-            Ok(volume) => Ok(Self { device, volume }),
-            Err(error) => Err((device, error)),
-        }
-    }
-
-    /// Parsed geometry of the mounted volume.
-    pub fn geometry(&self) -> Geometry {
-        self.volume.geometry()
-    }
-    /// Borrow the underlying block device.
-    pub fn device(&self) -> &D {
-        &self.device
-    }
-    /// Mutably borrow the underlying block device.
-    pub fn device_mut(&mut self) -> &mut D {
-        &mut self.device
-    }
-    /// Consume the filesystem and return its block device.
-    pub fn into_device(self) -> D {
-        self.device
-    }
-
     /// Open a regular file without tying the returned handle to this
     /// filesystem borrow.  Mutation support extends this handle with the
     /// directory-entry locator while retaining the same public shape.
