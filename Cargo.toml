@@ -5,7 +5,7 @@ edition = "2024"
 rust-version = "1.88"
 license = "MIT OR Apache-2.0"
 description = "Allocation-free, no_std exFAT filesystem primitives"
-repository = "https://github.com/tesync-hub/exfat-fs"
+repository = "https://github.com/joebnb/extfat-fs"
 keywords = ["exfat", "filesystem", "embedded", "no-std"]
 categories = ["embedded", "no-std", "filesystem"]
 
