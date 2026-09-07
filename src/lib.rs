@@ -1,4 +1,4 @@
-//! `exfat-fs` is a `no_std`, allocation-free exFAT implementation.
+//! `exfat-embedded` is a `no_std`, allocation-free exFAT implementation.
 //!
 //! The crate deliberately makes sector scratch storage an explicit caller
 //! resource. It never buffers a whole exFAT cluster or directory, so cards

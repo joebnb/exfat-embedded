@@ -1,6 +1,6 @@
-# exfat-fs
+# exfat-embedded
 
-`exfat-fs` is an allocation-free, `no_std` exFAT filesystem crate for
+`exfat-embedded` is an allocation-free, `no_std` exFAT filesystem crate for
 embedded systems. It is designed for ordinary removable media: MBR or GPT
 partition tables, 512–4096 byte sectors, and large exFAT clusters.
 
@@ -12,7 +12,7 @@ formatted by a desktop OS may use 128 KiB or larger clusters; filesystem
 implementations that materialise a directory or cache a complete cluster can
 therefore fail on a microcontroller despite the card being perfectly valid.
 
-`exfat-fs` exists to make that failure mode unnecessary. It reads and writes
+`exfat-embedded` exists to make that failure mode unnecessary. It reads and writes
 one sector at a time, streams directory entry sets across sector and cluster
 boundaries, and requires every temporary buffer to be supplied by the caller.
 The result is suitable for a long-lived embedded worker that needs to browse
@@ -69,7 +69,7 @@ filesystem just like `Scratch`.
 
 ## Transport independence
 
-`exfat-fs` intentionally includes no SD, SPI, DMA, or GPIO driver. Those
+`exfat-embedded` intentionally includes no SD, SPI, DMA, or GPIO driver. Those
 concerns sit below `BlockDevice`: a host image, SDMMC host, USB mass-storage
 bridge, SPI SD transport, or fixture can all implement the same trait.
 Transport clock rate, bus width, and separate MOSI/MISO versus a shared
@@ -81,7 +81,7 @@ The repository's default Cargo target is the ESP32-S3. Run the crate's host
 fixture tests explicitly on macOS with:
 
 ```sh
-cargo +stable test -p exfat-fs --target aarch64-apple-darwin
+cargo +stable test -p exfat-embedded --target aarch64-apple-darwin
 ```
 
 The fixtures cover MBR and GPT mounting, system-entry discovery, bitmap
