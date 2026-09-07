@@ -4,6 +4,14 @@
 embedded systems. It is designed for ordinary removable media: MBR or GPT
 partition tables, 512–4096 byte sectors, and large exFAT clusters.
 
+## Availability
+
+- Source repository: <https://github.com/joebnb/exfat-embedded>
+- Planned crates.io package: <https://crates.io/crates/exfat-embedded>
+
+The crates.io page is the intended publication address for package
+`exfat-embedded`; it will become available after the first `cargo publish`.
+
 ## Motivation
 
 exFAT is often the practical format for modern SD cards, but an embedded
