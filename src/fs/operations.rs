@@ -311,10 +311,11 @@ impl<D: BlockDevice> FileSystem<D> {
         )
     }
 
-    /// Remove a file or an empty directory and release its allocated clusters.
+    /// Remove a file or directory tree and release all allocated clusters.
     ///
-    /// The root directory cannot be removed. Directories must be empty; this
-    /// prevents a recursive delete from silently discarding user data.
+    /// Directories are removed depth-first, including all files and nested
+    /// directories they contain. Call [`Self::is_dir_empty`] first when an
+    /// application needs an empty-directory-only policy.
     pub fn remove(&mut self, path: &str, scratch: &mut Scratch<'_>) -> Result<(), Error<D::Error>> {
         let mut workspace = Workspace::new();
         self.remove_with_workspace(path, scratch, &mut workspace)
@@ -328,18 +329,62 @@ impl<D: BlockDevice> FileSystem<D> {
         workspace: &mut Workspace,
     ) -> Result<(), Error<D::Error>> {
         let entry = self.lookup_with_workspace(path.trim_matches('/'), scratch, workspace)?;
+        self.remove_entry_tree(entry, scratch)
+    }
+
+    /// Return whether `path` names an empty directory.
+    ///
+    /// This is a policy helper for callers that want to prompt before using
+    /// [`Self::remove`]. Passing a regular file returns [`Error::NotDirectory`].
+    pub fn is_dir_empty(
+        &mut self,
+        path: &str,
+        scratch: &mut Scratch<'_>,
+    ) -> Result<bool, Error<D::Error>> {
+        let mut workspace = Workspace::new();
+        self.is_dir_empty_with_workspace(path, scratch, &mut workspace)
+    }
+
+    /// [`Self::is_dir_empty`] using caller-owned path/entry workspace.
+    pub fn is_dir_empty_with_workspace(
+        &mut self,
+        path: &str,
+        scratch: &mut Scratch<'_>,
+        workspace: &mut Workspace,
+    ) -> Result<bool, Error<D::Error>> {
+        let entry = self.lookup_with_workspace(path.trim_matches('/'), scratch, workspace)?;
+        let directory = entry.directory().ok_or(Error::NotDirectory)?;
+        Ok(self.first_directory_entry(directory, scratch)?.is_none())
+    }
+
+    fn remove_entry_tree(
+        &mut self,
+        entry: DirectoryEntry,
+        scratch: &mut Scratch<'_>,
+    ) -> Result<(), Error<D::Error>> {
         if let Some(directory) = entry.directory() {
-            let mut empty = true;
-            self.read_directory(directory, scratch, |_| {
-                empty = false;
-                false
-            })?;
-            if !empty {
-                return Err(Error::DirectoryNotEmpty);
+            // Delete one child at a time, then restart this directory's scan.
+            // That keeps traversal allocation-free and avoids retaining a
+            // sector-backed iterator while its child mutates the media.
+            while let Some(child) = self.first_directory_entry(directory, scratch)? {
+                self.remove_entry_tree(child, scratch)?;
             }
         }
         self.retire_entry_set(&entry, scratch)?;
         self.release_entry_clusters(&entry, scratch)
+    }
+
+    fn first_directory_entry(
+        &mut self,
+        directory: Directory,
+        scratch: &mut Scratch<'_>,
+    ) -> Result<Option<DirectoryEntry>, Error<D::Error>> {
+        let mut first = None;
+        self.read_directory(directory, scratch, |entry| {
+            first = Some(entry.clone());
+            false
+        })?;
+        Ok(first)
     }
 
     /// Rename a file or directory inside its current parent directory.
