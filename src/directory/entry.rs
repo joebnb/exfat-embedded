@@ -46,12 +46,34 @@ pub struct DirectoryEntry {
     pub valid_length: u64,
     /// Whether the stream uses contiguous clusters.
     pub no_fat_chain: bool,
+    /// Creation timestamp as recorded by the exFAT primary entry.
+    pub created: ExfatTimestamp,
+    /// Last modification timestamp as recorded by the exFAT primary entry.
+    pub modified: ExfatTimestamp,
+    /// Last access date/time as recorded by the exFAT primary entry.
+    pub accessed: ExfatTimestamp,
     name: [u16; 255],
     name_len: u8,
     pub(crate) primary: EntryLocator,
     pub(crate) stream: EntryLocator,
     pub(crate) entry_locs: [EntryLocator; 19],
     pub(crate) entry_count: u8,
+}
+
+/// Timestamp payload stored by an exFAT primary directory entry.
+///
+/// `date_time` packs the FAT date (high 16 bits) and time (low 16 bits).
+/// `ten_millis` refines creation/modification time in 10 ms units; access
+/// timestamps normally leave it zero. `utc_offset` is the signed 15-minute
+/// offset encoded by exFAT, or `0x80` when the writer did not provide one.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Default)]
+pub struct ExfatTimestamp {
+    /// FAT-packed local date/time: date in high 16 bits, time in low 16 bits.
+    pub date_time: u32,
+    /// Additional 10-millisecond units for create/modify timestamps.
+    pub ten_millis: u8,
+    /// Signed 15-minute UTC offset, or `0x80` when unspecified.
+    pub utc_offset: u8,
 }
 
 /// Caller-owned reusable storage for path and directory-entry operations.
@@ -125,6 +147,21 @@ impl EntrySet {
                 data_length: 0,
                 valid_length: 0,
                 no_fat_chain: false,
+                created: ExfatTimestamp {
+                    date_time: 0,
+                    ten_millis: 0,
+                    utc_offset: 0x80,
+                },
+                modified: ExfatTimestamp {
+                    date_time: 0,
+                    ten_millis: 0,
+                    utc_offset: 0x80,
+                },
+                accessed: ExfatTimestamp {
+                    date_time: 0,
+                    ten_millis: 0,
+                    utc_offset: 0x80,
+                },
                 name: [0; 255],
                 name_len: 0,
                 primary: EntryLocator { lba: 0, offset: 0 },
@@ -155,6 +192,21 @@ impl EntrySet {
                     data_length: 0,
                     valid_length: 0,
                     no_fat_chain: false,
+                    created: ExfatTimestamp {
+                        date_time: le_u32(&raw[8..12]),
+                        ten_millis: raw[20],
+                        utc_offset: raw[22],
+                    },
+                    modified: ExfatTimestamp {
+                        date_time: le_u32(&raw[12..16]),
+                        ten_millis: raw[21],
+                        utc_offset: raw[23],
+                    },
+                    accessed: ExfatTimestamp {
+                        date_time: le_u32(&raw[16..20]),
+                        ten_millis: 0,
+                        utc_offset: raw[24],
+                    },
                     name: [0; 255],
                     name_len: 0,
                     primary: locator,
@@ -179,6 +231,11 @@ impl EntrySet {
                 self.entry.valid_length = le_u64(&raw[8..16]);
                 self.entry.data_length = le_u64(&raw[24..32]);
                 self.entry.first_cluster = le_u32(&raw[20..24]);
+                if self.entry.valid_length > self.entry.data_length
+                    || (self.entry.data_length != 0 && self.entry.first_cluster < 2)
+                {
+                    return Err(Error::Corrupt);
+                }
                 self.secondary_left -= 1;
                 Ok(None)
             }

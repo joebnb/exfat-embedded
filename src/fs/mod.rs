@@ -15,4 +15,5 @@ pub use file::File;
 pub struct FileSystem<D> {
     pub(crate) device: D,
     pub(crate) volume: Volume,
+    pub(crate) free_clusters: u32,
 }

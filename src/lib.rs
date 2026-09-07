@@ -21,10 +21,10 @@ mod mount;
 pub use core::device::{BlockDevice, Scratch};
 pub use core::error::Error;
 pub use core::geometry::{AllocationBitmap, Geometry, Partition, UpCaseTable};
-pub use directory::{Directory, DirectoryEntry, Workspace};
+pub use directory::{Directory, DirectoryEntry, ExfatTimestamp, Workspace};
 pub use format::format_exfat;
 pub use fs::{File, FileSystem};
-pub use mount::Volume;
+pub use mount::{Volume, VolumeLabel};
 
 #[cfg(test)]
 extern crate std;

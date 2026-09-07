@@ -7,6 +7,26 @@ pub struct Volume {
     pub(crate) geometry: Geometry,
     pub(crate) bitmap: AllocationBitmap,
     pub(crate) upcase: UpCaseTable,
+    pub(crate) label: VolumeLabel,
+}
+
+/// UTF-16 exFAT volume label (at most 11 code units).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VolumeLabel {
+    units: [u16; 11],
+    len: u8,
+}
+
+impl VolumeLabel {
+    /// Empty label used when the volume has no label entry.
+    pub const EMPTY: Self = Self {
+        units: [0; 11],
+        len: 0,
+    };
+    /// Label as UTF-16 units.
+    pub fn utf16(&self) -> &[u16] {
+        &self.units[..usize::from(self.len)]
+    }
 }
 
 impl Volume {
@@ -21,6 +41,10 @@ impl Volume {
     /// UpCase-table location and checksum.
     pub fn upcase_table(&self) -> UpCaseTable {
         self.upcase
+    }
+    /// Optional volume label stored in the root directory.
+    pub fn label(&self) -> VolumeLabel {
+        self.label
     }
 
     /// Validate and discover an exFAT volume on `device`.
@@ -50,12 +74,13 @@ impl Volume {
             .read_sector(partition.first_lba, scratch.sector(size))
             .map_err(Error::Device)?;
         let geometry = parse_boot(partition, scratch.sector(size), size)?;
-        let (bitmap, upcase) = discover_root_system_entries(device, geometry, scratch)?;
+        let (bitmap, upcase, label) = discover_root_system_entries(device, geometry, scratch)?;
         validate_upcase_table(device, geometry, upcase, scratch)?;
         Ok(Self {
             geometry,
             bitmap,
             upcase,
+            label,
         })
     }
 }
@@ -110,10 +135,11 @@ fn discover_root_system_entries<D: BlockDevice>(
     device: &mut D,
     geometry: Geometry,
     scratch: &mut Scratch<'_>,
-) -> Result<(AllocationBitmap, UpCaseTable), Error<D::Error>> {
+) -> Result<(AllocationBitmap, UpCaseTable, VolumeLabel), Error<D::Error>> {
     let sector_size = usize::from(geometry.bytes_per_sector);
     let mut bitmap = None;
     let mut upcase = None;
+    let mut label = VolumeLabel::EMPTY;
     let mut cluster = geometry.root_cluster;
     let mut visited = 0u32;
     loop {
@@ -128,7 +154,12 @@ fn discover_root_system_entries<D: BlockDevice>(
                 .map_err(Error::Device)?;
             for entry in scratch.sector(sector_size).chunks_exact(32) {
                 match entry[0] {
-                    0x00 => return bitmap.zip(upcase).ok_or(Error::Corrupt),
+                    0x00 => {
+                        return bitmap
+                            .zip(upcase)
+                            .map(|(b, u)| (b, u, label))
+                            .ok_or(Error::Corrupt);
+                    }
                     0x81 if entry[1] & 1 == 0 && bitmap.is_none() => {
                         bitmap = Some(AllocationBitmap {
                             first_cluster: le_u32(&entry[20..24]),
@@ -142,10 +173,21 @@ fn discover_root_system_entries<D: BlockDevice>(
                             byte_length: le_u64(&entry[24..32]),
                         })
                     }
+                    0x83 => {
+                        let len = usize::from(entry[1]).min(11);
+                        let mut units = [0u16; 11];
+                        for (index, word) in entry[2..24].chunks_exact(2).take(len).enumerate() {
+                            units[index] = u16::from_le_bytes(word.try_into().unwrap());
+                        }
+                        label = VolumeLabel {
+                            units,
+                            len: len as u8,
+                        };
+                    }
                     _ => {}
                 }
                 if let (Some(bitmap), Some(upcase)) = (bitmap, upcase) {
-                    return Ok((bitmap, upcase));
+                    return Ok((bitmap, upcase, label));
                 }
             }
         }

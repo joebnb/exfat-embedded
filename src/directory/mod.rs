@@ -4,4 +4,4 @@ pub(crate) mod codec;
 mod entry;
 
 pub(crate) use entry::EntrySet;
-pub use entry::{Directory, DirectoryEntry, Workspace};
+pub use entry::{Directory, DirectoryEntry, ExfatTimestamp, Workspace};

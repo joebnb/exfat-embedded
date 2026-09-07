@@ -3,6 +3,80 @@
 use crate::{BlockDevice, Error, FileSystem, Scratch};
 
 impl<D: BlockDevice> FileSystem<D> {
+    /// Total allocatable bytes in the mounted volume.
+    pub fn capacity_bytes(&self) -> u64 {
+        u64::from(self.volume.geometry().cluster_count)
+            * u64::from(self.volume.geometry().bytes_per_cluster())
+    }
+
+    /// Currently unallocated bytes, maintained as allocation metadata changes.
+    ///
+    /// The count is captured while mounting. Call [`Self::refresh_free_space`]
+    /// after another host might have modified removable media directly.
+    pub fn free_space_bytes(&self) -> u64 {
+        u64::from(self.free_clusters) * u64::from(self.volume.geometry().bytes_per_cluster())
+    }
+
+    /// Rescan the allocation bitmap and refresh the cached free-space count.
+    pub fn refresh_free_space(
+        &mut self,
+        scratch: &mut Scratch<'_>,
+    ) -> Result<u64, Error<D::Error>> {
+        self.refresh_free_clusters(scratch)?;
+        Ok(self.free_space_bytes())
+    }
+
+    pub(crate) fn refresh_free_clusters(
+        &mut self,
+        scratch: &mut Scratch<'_>,
+    ) -> Result<(), Error<D::Error>> {
+        let bitmap = self.volume.allocation_bitmap();
+        let sector_size = usize::from(self.volume.geometry().bytes_per_sector);
+        let mut byte = 0u64;
+        let mut remaining_bits = self.volume.geometry().cluster_count;
+        let mut used_clusters = 0u32;
+
+        while remaining_bits != 0 {
+            let (lba, offset) = self.bitmap_location(byte, scratch)?;
+            self.device
+                .read_sector(lba, scratch.sector(sector_size))
+                .map_err(Error::Device)?;
+            let cluster_bytes = u64::from(self.volume.geometry().bytes_per_cluster());
+            let bytes_until_next_cluster = cluster_bytes - byte % cluster_bytes;
+            let bytes = u64::try_from(sector_size - offset)
+                .map_err(|_| Error::Corrupt)?
+                .min(bytes_until_next_cluster)
+                .min(bitmap.byte_length.checked_sub(byte).ok_or(Error::Corrupt)?);
+            let bytes = usize::try_from(bytes).map_err(|_| Error::Corrupt)?;
+            if bytes == 0 {
+                return Err(Error::Corrupt);
+            }
+            for value in &scratch.sector(sector_size)[offset..offset + bytes] {
+                if remaining_bits == 0 {
+                    break;
+                }
+                let valid_bits = remaining_bits.min(8);
+                let mask = if valid_bits == 8 {
+                    u8::MAX
+                } else {
+                    (1u8 << valid_bits) - 1
+                };
+                used_clusters = used_clusters
+                    .checked_add((value & mask).count_ones())
+                    .ok_or(Error::Corrupt)?;
+                remaining_bits -= valid_bits;
+            }
+            byte = byte.checked_add(bytes as u64).ok_or(Error::Corrupt)?;
+        }
+        self.free_clusters = self
+            .volume
+            .geometry()
+            .cluster_count
+            .checked_sub(used_clusters)
+            .ok_or(Error::Corrupt)?;
+        Ok(())
+    }
+
     pub(crate) fn set_fat(
         &mut self,
         cluster: u32,
@@ -92,6 +166,18 @@ impl<D: BlockDevice> FileSystem<D> {
         self.device
             .read_sector(lba, scratch.sector(size))
             .map_err(Error::Device)?;
+        let was_used = scratch.sector(size)[offset] & (1 << bit) != 0;
+        if was_used == used {
+            return Ok(());
+        }
+        let new_free_clusters = if used {
+            self.free_clusters.checked_sub(1).ok_or(Error::Corrupt)?
+        } else {
+            self.free_clusters
+                .checked_add(1)
+                .filter(|count| *count <= self.volume.geometry().cluster_count)
+                .ok_or(Error::Corrupt)?
+        };
         if used {
             scratch.sector(size)[offset] |= 1 << bit;
         } else {
@@ -99,7 +185,9 @@ impl<D: BlockDevice> FileSystem<D> {
         }
         self.device
             .write_sector(lba, scratch.sector(size))
-            .map_err(Error::Device)
+            .map_err(Error::Device)?;
+        self.free_clusters = new_free_clusters;
+        Ok(())
     }
     pub(crate) fn allocate_cluster(
         &mut self,

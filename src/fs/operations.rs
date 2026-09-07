@@ -13,9 +13,49 @@ struct NewEntrySet<'a> {
     first_cluster: u32,
     data_length: u64,
     no_fat_chain: bool,
+    created: crate::ExfatTimestamp,
+    modified: crate::ExfatTimestamp,
+    accessed: crate::ExfatTimestamp,
 }
 
 impl<D: BlockDevice> FileSystem<D> {
+    fn file_cluster_at(
+        &mut self,
+        file: &mut File,
+        wanted: u64,
+        scratch: &mut Scratch<'_>,
+    ) -> Result<u32, Error<D::Error>> {
+        let cluster_count = self.volume.geometry.cluster_count;
+        if wanted >= u64::from(cluster_count) {
+            return Err(Error::Corrupt);
+        }
+        if file.no_fat_chain {
+            return file
+                .first_cluster
+                .checked_add(u32::try_from(wanted).map_err(|_| Error::Corrupt)?)
+                .filter(|cluster| (2..cluster_count.saturating_add(2)).contains(cluster))
+                .ok_or(Error::Corrupt);
+        }
+
+        let (mut index, mut cluster) = match file.cached_cluster_index {
+            Some(index) if index <= wanted => (index, file.cached_cluster),
+            _ => (0, file.first_cluster),
+        };
+        if !(2..cluster_count.saturating_add(2)).contains(&cluster) {
+            return Err(Error::Corrupt);
+        }
+        while index < wanted {
+            cluster = self.next_cluster(cluster, scratch)?;
+            if !(2..cluster_count.saturating_add(2)).contains(&cluster) {
+                return Err(Error::Corrupt);
+            }
+            index += 1;
+        }
+        file.cached_cluster_index = Some(wanted);
+        file.cached_cluster = cluster;
+        Ok(cluster)
+    }
+
     /// Open a regular file without tying the returned handle to this
     /// filesystem borrow.  Mutation support extends this handle with the
     /// directory-entry locator while retaining the same public shape.
@@ -45,6 +85,8 @@ impl<D: BlockDevice> FileSystem<D> {
             valid_length: entry.valid_length,
             position: 0,
             no_fat_chain: entry.no_fat_chain,
+            cached_cluster_index: None,
+            cached_cluster: 0,
         })
     }
 
@@ -67,13 +109,7 @@ impl<D: BlockDevice> FileSystem<D> {
         while done < wanted {
             let offset = file.position;
             let cluster_index = offset / cluster_bytes;
-            let cluster = if file.no_fat_chain {
-                file.first_cluster
-                    .checked_add(cluster_index as u32)
-                    .ok_or(Error::Corrupt)?
-            } else {
-                self.cluster_at(file.first_cluster, cluster_index, scratch)?
-            };
+            let cluster = self.file_cluster_at(file, cluster_index, scratch)?;
             let within = offset % cluster_bytes;
             let lba = g.cluster_lba(cluster).ok_or(Error::Corrupt)? + within / sector_size as u64;
             let sector_offset = within as usize % sector_size;
@@ -112,13 +148,7 @@ impl<D: BlockDevice> FileSystem<D> {
         while done < wanted {
             let offset = file.position;
             let index = offset / cluster_bytes;
-            let cluster = if file.no_fat_chain {
-                file.first_cluster
-                    .checked_add(index as u32)
-                    .ok_or(Error::Corrupt)?
-            } else {
-                self.cluster_at(file.first_cluster, index, scratch)?
-            };
+            let cluster = self.file_cluster_at(file, index, scratch)?;
             let within = offset % cluster_bytes;
             let lba = g.cluster_lba(cluster).ok_or(Error::Corrupt)? + within / sector_size as u64;
             let sector_offset = within as usize % sector_size;
@@ -202,6 +232,9 @@ impl<D: BlockDevice> FileSystem<D> {
                 first_cluster: 0,
                 data_length: 0,
                 no_fat_chain: true,
+                created: crate::ExfatTimestamp::default(),
+                modified: crate::ExfatTimestamp::default(),
+                accessed: crate::ExfatTimestamp::default(),
             },
             scratch,
         )?;
@@ -215,6 +248,8 @@ impl<D: BlockDevice> FileSystem<D> {
             valid_length: 0,
             position: 0,
             no_fat_chain: true,
+            cached_cluster_index: None,
+            cached_cluster: 0,
         })
     }
 
@@ -268,9 +303,135 @@ impl<D: BlockDevice> FileSystem<D> {
                 first_cluster: cluster,
                 data_length: cluster_bytes,
                 no_fat_chain: false,
+                created: crate::ExfatTimestamp::default(),
+                modified: crate::ExfatTimestamp::default(),
+                accessed: crate::ExfatTimestamp::default(),
             },
             scratch,
         )
+    }
+
+    /// Remove a file or an empty directory and release its allocated clusters.
+    ///
+    /// The root directory cannot be removed. Directories must be empty; this
+    /// prevents a recursive delete from silently discarding user data.
+    pub fn remove(&mut self, path: &str, scratch: &mut Scratch<'_>) -> Result<(), Error<D::Error>> {
+        let mut workspace = Workspace::new();
+        self.remove_with_workspace(path, scratch, &mut workspace)
+    }
+
+    /// [`Self::remove`] using caller-owned path/entry workspace.
+    pub fn remove_with_workspace(
+        &mut self,
+        path: &str,
+        scratch: &mut Scratch<'_>,
+        workspace: &mut Workspace,
+    ) -> Result<(), Error<D::Error>> {
+        let entry = self.lookup_with_workspace(path.trim_matches('/'), scratch, workspace)?;
+        if let Some(directory) = entry.directory() {
+            let mut empty = true;
+            self.read_directory(directory, scratch, |_| {
+                empty = false;
+                false
+            })?;
+            if !empty {
+                return Err(Error::DirectoryNotEmpty);
+            }
+        }
+        self.retire_entry_set(&entry, scratch)?;
+        self.release_entry_clusters(&entry, scratch)
+    }
+
+    /// Rename a file or directory inside its current parent directory.
+    ///
+    /// The operation preserves all stream metadata and timestamps. If the
+    /// new name needs more directory slots, it writes a replacement entry set
+    /// in the same parent before retiring the original one.
+    pub fn rename(
+        &mut self,
+        path: &str,
+        new_name: &str,
+        scratch: &mut Scratch<'_>,
+    ) -> Result<(), Error<D::Error>> {
+        let mut workspace = Workspace::new();
+        self.rename_with_workspace(path, new_name, scratch, &mut workspace)
+    }
+
+    /// [`Self::rename`] using caller-owned workspace.
+    pub fn rename_with_workspace(
+        &mut self,
+        path: &str,
+        new_name: &str,
+        scratch: &mut Scratch<'_>,
+        workspace: &mut Workspace,
+    ) -> Result<(), Error<D::Error>> {
+        if new_name.is_empty() || new_name.contains('/') {
+            return Err(Error::InvalidPath);
+        }
+        let entry = self.lookup_with_workspace(path.trim_matches('/'), scratch, workspace)?;
+        let len = utf8_to_utf16(new_name, &mut workspace.utf16)?;
+        let name_entries = len.div_ceil(15);
+        if name_entries + 2 > usize::from(entry.entry_count) {
+            let parent = match path.trim_matches('/').rsplit_once('/') {
+                Some((parent_path, _)) => self
+                    .lookup_with_workspace(parent_path, scratch, workspace)?
+                    .directory()
+                    .ok_or(Error::NotDirectory)?,
+                None => Directory::root(self.volume.geometry),
+            };
+            let locators = self.find_free_entries(parent, name_entries + 2, scratch, workspace)?;
+            self.write_entry_set(
+                &locators[..name_entries + 2],
+                NewEntrySet {
+                    name: &workspace.utf16[..len],
+                    attributes: if entry.is_directory { 0x10 } else { 0 },
+                    first_cluster: entry.first_cluster,
+                    data_length: entry.data_length,
+                    no_fat_chain: entry.no_fat_chain,
+                    created: entry.created,
+                    modified: entry.modified,
+                    accessed: entry.accessed,
+                },
+                scratch,
+            )?;
+            return self.retire_entry_set(&entry, scratch);
+        }
+        let hash = self.upcase_name_hash(&workspace.utf16[..len], scratch)?;
+        let size = usize::from(self.volume.geometry.bytes_per_sector);
+        self.device
+            .read_sector(entry.stream.lba, scratch.sector(size))
+            .map_err(Error::Device)?;
+        let stream = usize::from(entry.stream.offset);
+        scratch.sector(size)[stream + 3] = len as u8;
+        scratch.sector(size)[stream + 4..stream + 6].copy_from_slice(&hash.to_le_bytes());
+        self.device
+            .write_sector(entry.stream.lba, scratch.sector(size))
+            .map_err(Error::Device)?;
+        for (index, locator) in entry.entry_locs[2..usize::from(entry.entry_count)]
+            .iter()
+            .copied()
+            .enumerate()
+        {
+            self.device
+                .read_sector(locator.lba, scratch.sector(size))
+                .map_err(Error::Device)?;
+            let offset = usize::from(locator.offset);
+            let row = &mut scratch.sector(size)[offset..offset + 32];
+            row[0] = 0xc1;
+            row[2..32].fill(0);
+            let start = index * 15;
+            for (unit_index, unit) in workspace.utf16[start..len.min(start + 15)]
+                .iter()
+                .copied()
+                .enumerate()
+            {
+                row[2 + unit_index * 2..4 + unit_index * 2].copy_from_slice(&unit.to_le_bytes());
+            }
+            self.device
+                .write_sector(locator.lba, scratch.sector(size))
+                .map_err(Error::Device)?;
+        }
+        self.recompute_entry_checksum(&entry, scratch)
     }
 
     /// Append initialized bytes, allocating clusters and committing metadata.
@@ -284,6 +445,7 @@ impl<D: BlockDevice> FileSystem<D> {
             return Ok(0);
         }
         let original = *file;
+        file.cached_cluster_index = None;
         macro_rules! restore_on_err {
             ($result:expr) => {
                 match $result {
@@ -348,6 +510,7 @@ impl<D: BlockDevice> FileSystem<D> {
                         ));
                     }
                     file.no_fat_chain = false;
+                    file.cached_cluster_index = None;
                 }
                 restore_on_err!(self.set_fat(
                     restore_on_err!(last.ok_or(Error::Corrupt)),
@@ -401,7 +564,7 @@ impl<D: BlockDevice> FileSystem<D> {
                 let mut cluster = file.first_cluster;
                 for _ in 0..allocated {
                     let next = if file.no_fat_chain {
-                        cluster + 1
+                        cluster.checked_add(1).ok_or(Error::Corrupt)?
                     } else {
                         self.next_cluster(cluster, scratch)?
                     };
@@ -412,19 +575,22 @@ impl<D: BlockDevice> FileSystem<D> {
                 file.first_cluster = 0;
             } else {
                 let last = if file.no_fat_chain {
-                    file.first_cluster + keep as u32 - 1
+                    file.first_cluster
+                        .checked_add(u32::try_from(keep).map_err(|_| Error::Corrupt)?)
+                        .and_then(|cluster| cluster.checked_sub(1))
+                        .ok_or(Error::Corrupt)?
                 } else {
                     self.cluster_at(file.first_cluster, keep - 1, scratch)?
                 };
                 let mut cluster = if file.no_fat_chain {
-                    last + 1
+                    last.checked_add(1).ok_or(Error::Corrupt)?
                 } else {
                     self.next_cluster(last, scratch)?
                 };
                 self.set_fat(last, 0xffff_ffff, scratch)?;
                 for _ in keep..allocated {
                     let next = if file.no_fat_chain {
-                        cluster + 1
+                        cluster.checked_add(1).ok_or(Error::Corrupt)?
                     } else {
                         self.next_cluster(cluster, scratch)?
                     };
@@ -433,7 +599,8 @@ impl<D: BlockDevice> FileSystem<D> {
                     cluster = next;
                 }
             }
-            file.data_length = keep * cluster_bytes;
+            file.data_length = keep.checked_mul(cluster_bytes).ok_or(Error::Corrupt)?;
+            file.cached_cluster_index = None;
         }
         file.valid_length = len;
         file.position = ::core::cmp::min(file.position, len);
@@ -513,7 +680,7 @@ impl<D: BlockDevice> FileSystem<D> {
                 let usable = if directory.data_length == 0 {
                     size
                 } else {
-                    ::core::cmp::min(size, remaining as usize)
+                    ::core::cmp::min(size as u64, remaining) as usize
                 };
                 for slot in 0..usable / 32 {
                     let offset = slot * 32;
@@ -707,7 +874,7 @@ impl<D: BlockDevice> FileSystem<D> {
                 let usable = if directory.data_length == 0 {
                     sector_size
                 } else {
-                    ::core::cmp::min(sector_size, remaining as usize)
+                    ::core::cmp::min(sector_size as u64, remaining) as usize
                 };
                 for (slot, entry) in bytes[..usable].chunks_exact(32).enumerate() {
                     if entry[0] == 0 {
@@ -785,6 +952,14 @@ impl<D: BlockDevice> FileSystem<D> {
                     entry[0] = 0x85;
                     entry[1] = (locators.len() - 1) as u8;
                     entry[4..6].copy_from_slice(&contents.attributes.to_le_bytes());
+                    entry[8..12].copy_from_slice(&contents.created.date_time.to_le_bytes());
+                    entry[12..16].copy_from_slice(&contents.modified.date_time.to_le_bytes());
+                    entry[16..20].copy_from_slice(&contents.accessed.date_time.to_le_bytes());
+                    entry[20] = contents.created.ten_millis;
+                    entry[21] = contents.modified.ten_millis;
+                    entry[22] = contents.created.utc_offset;
+                    entry[23] = contents.modified.utc_offset;
+                    entry[24] = contents.accessed.utc_offset;
                 }
                 1 => {
                     entry[0] = 0xc0;
@@ -883,7 +1058,7 @@ impl<D: BlockDevice> FileSystem<D> {
                     let slots = if directory.data_length == 0 {
                         size / 32
                     } else {
-                        ::core::cmp::min(size, remaining as usize) / 32
+                        (::core::cmp::min(size as u64, remaining) as usize) / 32
                     };
                     for slot in 0..slots {
                         if scratch.sector(size)[slot * 32] & 0x80 == 0 {
@@ -952,6 +1127,8 @@ impl<D: BlockDevice> FileSystem<D> {
                         valid_length: directory.data_length,
                         position: 0,
                         no_fat_chain: false,
+                        cached_cluster_index: None,
+                        cached_cluster: 0,
                     };
                     self.update_stream(&meta, scratch)?;
                 }
@@ -975,6 +1152,95 @@ impl<D: BlockDevice> FileSystem<D> {
                 break;
             }
         }
+    }
+
+    fn retire_entry_set(
+        &mut self,
+        entry: &DirectoryEntry,
+        scratch: &mut Scratch<'_>,
+    ) -> Result<(), Error<D::Error>> {
+        let size = usize::from(self.volume.geometry.bytes_per_sector);
+        for locator in entry.entry_locs[..usize::from(entry.entry_count)]
+            .iter()
+            .copied()
+        {
+            let offset = usize::from(locator.offset);
+            if offset + 32 > size {
+                return Err(Error::Corrupt);
+            }
+            self.device
+                .read_sector(locator.lba, scratch.sector(size))
+                .map_err(Error::Device)?;
+            // Clearing the in-use bit is the exFAT deletion marker. Preserve
+            // the remainder for media recovery tools while making the slots
+            // immediately reusable by `find_free_entries`.
+            scratch.sector(size)[offset] &= !0x80;
+            self.device
+                .write_sector(locator.lba, scratch.sector(size))
+                .map_err(Error::Device)?;
+        }
+        Ok(())
+    }
+
+    fn recompute_entry_checksum(
+        &mut self,
+        entry: &DirectoryEntry,
+        scratch: &mut Scratch<'_>,
+    ) -> Result<(), Error<D::Error>> {
+        let size = usize::from(self.volume.geometry.bytes_per_sector);
+        let mut checksum = 0u16;
+        for (entry_index, locator) in entry.entry_locs[..usize::from(entry.entry_count)]
+            .iter()
+            .copied()
+            .enumerate()
+        {
+            self.device
+                .read_sector(locator.lba, scratch.sector(size))
+                .map_err(Error::Device)?;
+            let offset = usize::from(locator.offset);
+            checksum = entry_set_checksum_step(
+                checksum,
+                &scratch.sector(size)[offset..offset + 32],
+                entry_index == 0,
+            );
+        }
+        self.device
+            .read_sector(entry.primary.lba, scratch.sector(size))
+            .map_err(Error::Device)?;
+        let offset = usize::from(entry.primary.offset);
+        scratch.sector(size)[offset + 2..offset + 4].copy_from_slice(&checksum.to_le_bytes());
+        self.device
+            .write_sector(entry.primary.lba, scratch.sector(size))
+            .map_err(Error::Device)
+    }
+
+    fn release_entry_clusters(
+        &mut self,
+        entry: &DirectoryEntry,
+        scratch: &mut Scratch<'_>,
+    ) -> Result<(), Error<D::Error>> {
+        if entry.first_cluster < 2 || entry.data_length == 0 {
+            return Ok(());
+        }
+        let cluster_bytes = u64::from(self.volume.geometry.bytes_per_cluster());
+        let clusters = entry.data_length.div_ceil(cluster_bytes);
+        let mut cluster = entry.first_cluster;
+        for index in 0..clusters {
+            let next = if entry.no_fat_chain || index + 1 == clusters {
+                None
+            } else {
+                Some(self.next_cluster(cluster, scratch)?)
+            };
+            self.set_fat(cluster, 0, scratch)?;
+            self.set_bitmap(cluster, false, scratch)?;
+            if let Some(next) = next {
+                if next < 2 || next >= self.volume.geometry.cluster_count.saturating_add(2) {
+                    return Err(Error::Corrupt);
+                }
+                cluster = next;
+            }
+        }
+        Ok(())
     }
 
     fn update_stream(

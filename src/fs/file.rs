@@ -21,6 +21,10 @@ pub struct File {
     pub(crate) valid_length: u64,
     pub(crate) position: u64,
     pub(crate) no_fat_chain: bool,
+    // The last cluster resolved through a FAT chain. Sequential I/O can
+    // continue from here instead of walking from the first cluster each time.
+    pub(crate) cached_cluster_index: Option<u64>,
+    pub(crate) cached_cluster: u32,
 }
 
 impl File {

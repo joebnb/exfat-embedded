@@ -35,6 +35,8 @@ pub enum Error<E> {
     NameTooLong,
     /// An operation requiring a file was passed a directory.
     IsDirectory,
+    /// A directory removal was requested while it still contains entries.
+    DirectoryNotEmpty,
     /// An operation attempted to grow through `truncate` or read past EOF.
     EndOfFile,
 }
