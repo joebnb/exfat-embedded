@@ -1,21 +1,20 @@
 use crate::Error;
-/// Synchronous sector-addressable storage used by [`crate::FileSystem`].
-///
-/// Implementations must transfer exactly one logical sector for each read or
-/// write call.  Filesystem access is serialized by the caller.
-pub trait BlockDevice {
+/// Async sector-addressable storage used by the Embassy-facing exFAT API.
+
+#[allow(async_fn_in_trait)]
+pub trait AsyncBlockDevice {
     /// Device-specific I/O failure type.
     type Error;
     /// Logical sector size in bytes; exFAT supports 512 through 4096 here.
     fn sector_size(&self) -> usize;
     /// Number of addressable logical sectors.
     fn sector_count(&self) -> u64;
-    /// Read sector `lba` into the equally sized `out` buffer.
-    fn read_sector(&mut self, lba: u64, out: &mut [u8]) -> Result<(), Self::Error>;
-    /// Persist `data` as sector `lba`.
-    fn write_sector(&mut self, lba: u64, data: &[u8]) -> Result<(), Self::Error>;
+    /// Read one sector into `out`.
+    async fn read_sector(&mut self, lba: u64, out: &mut [u8]) -> Result<(), Self::Error>;
+    /// Write one sector from `data`.
+    async fn write_sector(&mut self, lba: u64, data: &[u8]) -> Result<(), Self::Error>;
     /// Commit preceding writes to stable media.
-    fn flush(&mut self) -> Result<(), Self::Error>;
+    async fn flush(&mut self) -> Result<(), Self::Error>;
 }
 /// Caller-owned temporary storage for exactly one device sector.
 pub struct Scratch<'a> {

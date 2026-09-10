@@ -1,11 +1,11 @@
 //! Filesystem construction and block-device ownership accessors.
 
-use crate::{BlockDevice, Error, FileSystem, Geometry, Scratch, Volume};
+use crate::{AsyncBlockDevice, Error, FileSystem, Geometry, Scratch, Volume};
 
-impl<D: BlockDevice> FileSystem<D> {
+impl<D: AsyncBlockDevice> FileSystem<D> {
     /// Mount `device`, retaining it as this filesystem's exclusive backend.
-    pub fn mount(mut device: D, scratch: &mut Scratch<'_>) -> Result<Self, Error<D::Error>> {
-        let volume = Volume::mount(&mut device, scratch)?;
+    pub async fn mount(mut device: D, scratch: &mut Scratch<'_>) -> Result<Self, Error<D::Error>> {
+        let volume = Volume::mount(&mut device, scratch).await?;
         Ok(Self {
             device,
             volume,
@@ -16,11 +16,11 @@ impl<D: BlockDevice> FileSystem<D> {
     /// Mount `device`, returning it on failure so removable media can be
     /// retried after a transient boot-sector read failure.
     #[inline(never)]
-    pub fn mount_recoverable(
+    pub async fn mount_recoverable(
         mut device: D,
         scratch: &mut Scratch<'_>,
     ) -> Result<Self, (D, Error<D::Error>)> {
-        match Volume::mount(&mut device, scratch) {
+        match Volume::mount(&mut device, scratch).await {
             Ok(volume) => Ok(Self {
                 device,
                 volume,

@@ -45,6 +45,10 @@ pub struct Geometry {
     pub fat_offset: u32,
     /// FAT length in sectors.
     pub fat_length: u32,
+    /// Number of FAT/Allocation-Bitmap pairs present (one or two).
+    pub number_of_fats: u8,
+    /// Index of the FAT selected by the volume's `ActiveFat` flag.
+    pub active_fat: u8,
     /// Cluster heap start, relative to partition start.
     pub cluster_heap_offset: u32,
     /// Number of allocatable clusters.
@@ -67,5 +71,15 @@ impl Geometry {
                 + u64::from(self.cluster_heap_offset)
                 + u64::from(cluster - 2) * u64::from(self.sectors_per_cluster),
         )
+    }
+
+    pub(crate) fn fat_lba_for_byte(&self, byte: u64) -> Option<u64> {
+        let active = u64::from(self.active_fat);
+        let fat_start = self
+            .partition
+            .first_lba
+            .checked_add(u64::from(self.fat_offset))?
+            .checked_add(active.checked_mul(u64::from(self.fat_length))?)?;
+        fat_start.checked_add(byte / u64::from(self.bytes_per_sector))
     }
 }

@@ -19,6 +19,51 @@ pub enum Error<E> {
     UnsupportedClusterSize,
     /// On-volume metadata is inconsistent or malformed.
     Corrupt,
+    /// A regular file's FAT chain ended or pointed outside the cluster heap
+    /// before its declared logical length was reached.
+    FileChainInvalid {
+        /// First cluster declared by the file's stream extension.
+        first_cluster: u32,
+        /// Zero-based file-cluster index that could not be resolved.
+        cluster_index: u64,
+        /// Cluster whose FAT entry was followed.
+        cluster: u32,
+        /// Next-cluster value read from the FAT.
+        next_cluster: u32,
+        /// FAT sector containing the entry.
+        fat_lba: u64,
+    },
+    /// Boot geometry fields are internally inconsistent.
+    BootGeometryCorrupt,
+    /// The root directory lacks valid allocation-bitmap or UpCase entries.
+    RootDirectoryCorrupt,
+    /// The UpCase table chain or checksum is invalid.
+    UpcaseTableCorrupt,
+    /// The UpCase entry checksum does not match the table bytes on media.
+    UpcaseChecksumMismatch {
+        /// Checksum declared by the UpCase directory entry.
+        expected: u32,
+        /// Checksum calculated from table bytes read from media.
+        actual: u32,
+    },
+    /// The UpCase directory entry has no usable table location.
+    UpcaseDescriptorInvalid {
+        /// First cluster declared by the UpCase directory entry.
+        first_cluster: u32,
+        /// Byte length declared by the UpCase directory entry.
+        byte_length: u64,
+    },
+    /// The FAT chain for the UpCase table points outside the volume.
+    UpcaseChainInvalid {
+        /// Cluster whose FAT entry was read.
+        cluster: u32,
+        /// Next cluster value read from the FAT.
+        next_cluster: u32,
+        /// FAT sector containing the invalid entry.
+        fat_lba: u64,
+        /// Four raw little-endian bytes read from that FAT entry.
+        raw: [u8; 4],
+    },
     /// A path component does not exist.
     PathNotFound,
     /// A path component is not a directory.

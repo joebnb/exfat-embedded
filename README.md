@@ -29,14 +29,15 @@ hidden cluster cache, or a filesystem borrow held by the file handle.
 
 This crate intentionally solves only the filesystem layer. It is not an SD
 transport crate: SPI-mode SD, SDIO 1-bit/4-bit, USB mass storage, flash-backed
-test media, and host disk images can all be used by implementing `BlockDevice`.
+test media, and host disk images can all be used by implementing `AsyncBlockDevice`.
 In particular, SPI clock rate, SDIO bus width, card-detect wiring, and DMA
 policy are board/transport concerns and do not belong in the public exFAT API.
 
-All I/O is synchronous through `BlockDevice`. The application supplies a
-sector-sized `Scratch` buffer to each operation, so the crate never allocates
-or retains a directory cluster. This makes it suitable for microcontrollers
-where an SD card may use 128 KiB clusters but internal RAM is constrained.
+All sector I/O is asynchronous through `AsyncBlockDevice`. The application
+supplies a sector-sized `Scratch` buffer to each awaited operation, so the
+crate never allocates or retains a directory cluster. This makes it suitable
+for microcontrollers where an SD card may use 128 KiB clusters but internal
+RAM is constrained.
 
 The API provides MBR/GPT discovery (including GPT header and entry-array CRC
 validation), boot-region validation, mounted geometry,
@@ -78,7 +79,7 @@ filesystem just like `Scratch`.
 ## Transport independence
 
 `exfat-embedded` intentionally includes no SD, SPI, DMA, or GPIO driver. Those
-concerns sit below `BlockDevice`: a host image, SDMMC host, USB mass-storage
+concerns sit below `AsyncBlockDevice`: a host image, SDMMC host, USB mass-storage
 bridge, SPI SD transport, or fixture can all implement the same trait.
 Transport clock rate, bus width, and separate MOSI/MISO versus a shared
 three-wire data line are configured by that transport crate, never by exFAT.

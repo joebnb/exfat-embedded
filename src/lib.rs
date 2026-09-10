@@ -18,7 +18,7 @@ mod format;
 mod fs;
 mod mount;
 
-pub use core::device::{BlockDevice, Scratch};
+pub use core::device::{AsyncBlockDevice, Scratch};
 pub use core::error::Error;
 pub use core::geometry::{AllocationBitmap, Geometry, Partition, UpCaseTable};
 pub use directory::{Directory, DirectoryEntry, ExfatTimestamp, Workspace};

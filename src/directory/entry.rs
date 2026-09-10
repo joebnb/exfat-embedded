@@ -130,6 +130,9 @@ pub(crate) struct EntrySet {
     name_written: u8,
     expected_checksum: u16,
     checksum: u16,
+    // An unrecognized-but-valid entry set is consumed without yielding a
+    // file. This keeps a later ordinary file in the same directory visible.
+    ignored: bool,
     entry: DirectoryEntry,
 }
 
@@ -141,6 +144,7 @@ impl EntrySet {
             name_written: 0,
             expected_checksum: 0,
             checksum: 0,
+            ignored: false,
             entry: DirectoryEntry {
                 is_directory: false,
                 first_cluster: 0,
@@ -179,11 +183,17 @@ impl EntrySet {
     ) -> Result<Option<DirectoryEntry>, Error<E>> {
         match raw[0] {
             0x85 => {
+                // A new primary before the previous set completed makes both
+                // sets malformed; never silently discard the first one.
+                if self.secondary_left != 0 || raw[1] < 2 {
+                    return Err(Error::Corrupt);
+                }
                 self.secondary_left = raw[1];
                 self.stream_seen = false;
                 self.name_written = 0;
                 self.expected_checksum = le_u16(&raw[2..4]);
                 self.checksum = checksum_step(0, raw, true);
+                self.ignored = raw[1] > 18;
                 let mut entry_locs = [EntryLocator { lba: 0, offset: 0 }; 19];
                 entry_locs[0] = locator;
                 self.entry = DirectoryEntry {
@@ -217,7 +227,14 @@ impl EntrySet {
                 Ok(None)
             }
             _ if self.secondary_left == 0 => Ok(None),
-            0xc0 if !self.stream_seen => {
+            _ if self.ignored => {
+                self.secondary_left -= 1;
+                if self.secondary_left == 0 {
+                    self.ignored = false;
+                }
+                Ok(None)
+            }
+            0xc0 if !self.stream_seen && self.entry.entry_count == 1 => {
                 if self.entry.entry_count >= 19 {
                     return Err(Error::Corrupt);
                 }
@@ -231,15 +248,22 @@ impl EntrySet {
                 self.entry.valid_length = le_u64(&raw[8..16]);
                 self.entry.data_length = le_u64(&raw[24..32]);
                 self.entry.first_cluster = le_u32(&raw[20..24]);
-                if self.entry.valid_length > self.entry.data_length
+                if raw[1] & !0x03 != 0
+                    || raw[1] & 1 == 0
+                    || self.entry.name_len == 0
+                    || self.entry.valid_length > self.entry.data_length
                     || (self.entry.data_length != 0 && self.entry.first_cluster < 2)
                 {
                     return Err(Error::Corrupt);
                 }
                 self.secondary_left -= 1;
-                Ok(None)
+                if self.secondary_left == 0 {
+                    self.complete()
+                } else {
+                    Ok(None)
+                }
             }
-            0xc1 if self.stream_seen => {
+            0xc1 if self.stream_seen && self.name_written < self.entry.name_len => {
                 if self.entry.entry_count >= 19 {
                     return Err(Error::Corrupt);
                 }
@@ -256,32 +280,32 @@ impl EntrySet {
                 self.name_written = self.name_written.saturating_add(15);
                 self.secondary_left -= 1;
                 if self.secondary_left == 0 {
-                    if self.checksum != self.expected_checksum {
-                        return Err(Error::Corrupt);
-                    }
-                    Ok(Some(self.entry.clone()))
+                    self.complete()
                 } else {
                     Ok(None)
                 }
             }
             _ => {
-                if self.entry.entry_count >= 19 {
-                    return Err(Error::Corrupt);
-                }
-                self.entry.entry_locs[self.entry.entry_count as usize] = locator;
-                self.entry.entry_count += 1;
-                self.checksum = checksum_step(self.checksum, raw, false);
+                // An unknown critical secondary must make the set
+                // unrecognized; an unknown benign secondary may be ignored.
+                // Either way, do not expose a partially understood file to a
+                // mutating API. Consume the rest of the set and resume the
+                // directory scanner at the next primary entry.
+                self.ignored = true;
                 self.secondary_left -= 1;
-                if self.secondary_left == 0 {
-                    if self.checksum != self.expected_checksum {
-                        return Err(Error::Corrupt);
-                    }
-                    Ok(Some(self.entry.clone()))
-                } else {
-                    Ok(None)
-                }
+                Ok(None)
             }
         }
+    }
+
+    fn complete<E>(&self) -> Result<Option<DirectoryEntry>, Error<E>> {
+        if !self.stream_seen
+            || self.name_written < self.entry.name_len
+            || self.checksum != self.expected_checksum
+        {
+            return Err(Error::Corrupt);
+        }
+        Ok(Some(self.entry.clone()))
     }
 }
 

@@ -4,7 +4,7 @@
 //! sectors after LBA 0. It is deliberately synchronous: callers must own the
 //! device exclusively and surface an explicit confirmation before invoking it.
 
-use crate::{BlockDevice, Error, Scratch};
+use crate::{AsyncBlockDevice, Error, Scratch};
 
 const BOOT_SECTORS: u32 = 24;
 const FAT_OFFSET: u32 = BOOT_SECTORS;
@@ -16,7 +16,7 @@ const UPCASE_BYTES: u64 = 65_536 * 2;
 /// This is intentionally a whole-device operation. It installs an MBR with a
 /// single type-0x07 partition at LBA 1 and does not preserve any prior data,
 /// partition table, volume label, or files.
-pub fn format_exfat<D: BlockDevice>(
+pub async fn format_exfat<D: AsyncBlockDevice>(
     device: &mut D,
     scratch: &mut Scratch<'_>,
 ) -> Result<(), Error<D::Error>> {
@@ -48,7 +48,7 @@ pub fn format_exfat<D: BlockDevice>(
         return Err(Error::Corrupt);
     }
 
-    write_mbr(device, scratch, partition_sectors as u32)?;
+    write_mbr(device, scratch, partition_sectors as u32).await?;
     let checksum = write_boot_region(
         device,
         scratch,
@@ -58,8 +58,9 @@ pub fn format_exfat<D: BlockDevice>(
         heap_offset,
         clusters,
         sectors_per_cluster,
-    )?;
-    write_boot_checksum(device, scratch, 1 + 11, checksum)?;
+    )
+    .await?;
+    write_boot_checksum(device, scratch, 1 + 11, checksum).await?;
     // exFAT's backup boot region is an exact second copy.
     let checksum = write_boot_region(
         device,
@@ -70,8 +71,9 @@ pub fn format_exfat<D: BlockDevice>(
         heap_offset,
         clusters,
         sectors_per_cluster,
-    )?;
-    write_boot_checksum(device, scratch, 1 + 23, checksum)?;
+    )
+    .await?;
+    write_boot_checksum(device, scratch, 1 + 23, checksum).await?;
 
     write_fat(
         device,
@@ -84,7 +86,8 @@ pub fn format_exfat<D: BlockDevice>(
         bitmap_clusters,
         upcase_cluster,
         upcase_clusters,
-    )?;
+    )
+    .await?;
     write_bitmap(
         device,
         scratch,
@@ -94,7 +97,8 @@ pub fn format_exfat<D: BlockDevice>(
         bitmap_cluster,
         bitmap_bytes,
         reserved_clusters,
-    )?;
+    )
+    .await?;
     let upcase_checksum = write_upcase(
         device,
         scratch,
@@ -102,7 +106,8 @@ pub fn format_exfat<D: BlockDevice>(
         heap_offset,
         sectors_per_cluster,
         upcase_cluster,
-    )?;
+    )
+    .await?;
     write_root(
         device,
         scratch,
@@ -112,8 +117,9 @@ pub fn format_exfat<D: BlockDevice>(
         bitmap_bytes,
         upcase_cluster,
         upcase_checksum,
-    )?;
-    device.flush().map_err(Error::Device)
+    )
+    .await?;
+    device.flush().await.map_err(Error::Device)
 }
 
 fn cluster_sectors(sectors: u64) -> u32 {
@@ -141,7 +147,7 @@ fn layout<E>(sectors: u64, spc: u32) -> Result<(u32, u32, u32), Error<E>> {
     Err(Error::Corrupt)
 }
 
-fn write_mbr<D: BlockDevice>(
+async fn write_mbr<D: AsyncBlockDevice>(
     device: &mut D,
     scratch: &mut Scratch<'_>,
     sectors: u32,
@@ -152,10 +158,10 @@ fn write_mbr<D: BlockDevice>(
     out[454..458].copy_from_slice(&1u32.to_le_bytes());
     out[458..462].copy_from_slice(&sectors.to_le_bytes());
     out[510..512].copy_from_slice(&[0x55, 0xaa]);
-    device.write_sector(0, out).map_err(Error::Device)
+    device.write_sector(0, out).await.map_err(Error::Device)
 }
 
-fn write_boot_region<D: BlockDevice>(
+async fn write_boot_region<D: AsyncBlockDevice>(
     device: &mut D,
     scratch: &mut Scratch<'_>,
     start: u64,
@@ -194,12 +200,13 @@ fn write_boot_region<D: BlockDevice>(
         }
         device
             .write_sector(start + sector, out)
+            .await
             .map_err(Error::Device)?;
     }
     Ok(checksum)
 }
 
-fn write_boot_checksum<D: BlockDevice>(
+async fn write_boot_checksum<D: AsyncBlockDevice>(
     device: &mut D,
     scratch: &mut Scratch<'_>,
     lba: u64,
@@ -209,10 +216,10 @@ fn write_boot_checksum<D: BlockDevice>(
     for word in out.chunks_exact_mut(4) {
         word.copy_from_slice(&checksum.to_le_bytes());
     }
-    device.write_sector(lba, out).map_err(Error::Device)
+    device.write_sector(lba, out).await.map_err(Error::Device)
 }
 
-fn write_fat<D: BlockDevice>(
+async fn write_fat<D: AsyncBlockDevice>(
     device: &mut D,
     scratch: &mut Scratch<'_>,
     part: u64,
@@ -252,6 +259,7 @@ fn write_fat<D: BlockDevice>(
         }
         device
             .write_sector(part + u64::from(FAT_OFFSET + sector), out)
+            .await
             .map_err(Error::Device)?;
     }
     let _ = (heap, spc);
@@ -261,7 +269,7 @@ fn write_fat<D: BlockDevice>(
 fn cluster_lba(part: u64, heap: u32, spc: u32, cluster: u32) -> u64 {
     part + u64::from(heap) + u64::from(cluster - 2) * u64::from(spc)
 }
-fn write_bitmap<D: BlockDevice>(
+async fn write_bitmap<D: AsyncBlockDevice>(
     device: &mut D,
     scratch: &mut Scratch<'_>,
     part: u64,
@@ -282,13 +290,13 @@ fn write_bitmap<D: BlockDevice>(
                 out[(bit / 8) as usize] |= 1 << (bit % 8);
             }
         }
-        device.write_sector(lba, out).map_err(Error::Device)?;
+        device.write_sector(lba, out).await.map_err(Error::Device)?;
         left -= n as u64;
         lba += 1;
     }
     Ok(())
 }
-fn write_upcase<D: BlockDevice>(
+async fn write_upcase<D: AsyncBlockDevice>(
     device: &mut D,
     scratch: &mut Scratch<'_>,
     part: u64,
@@ -314,12 +322,12 @@ fn write_upcase<D: BlockDevice>(
             }
             code += 1;
         }
-        device.write_sector(lba, out).map_err(Error::Device)?;
+        device.write_sector(lba, out).await.map_err(Error::Device)?;
         lba += 1;
     }
     Ok(sum)
 }
-fn write_root<D: BlockDevice>(
+async fn write_root<D: AsyncBlockDevice>(
     device: &mut D,
     scratch: &mut Scratch<'_>,
     part: u64,
@@ -340,5 +348,6 @@ fn write_root<D: BlockDevice>(
     out[56..64].copy_from_slice(&UPCASE_BYTES.to_le_bytes());
     device
         .write_sector(cluster_lba(part, heap, 1, 2), out)
+        .await
         .map_err(Error::Device)
 }

@@ -3,7 +3,7 @@
 use super::{EntryLocator, File};
 use crate::directory::EntrySet;
 use crate::directory::codec::{entry_set_checksum_step, utf8_to_utf16};
-use crate::{BlockDevice, Directory, DirectoryEntry, Error, FileSystem, Scratch, Workspace};
+use crate::{AsyncBlockDevice, Directory, DirectoryEntry, Error, FileSystem, Scratch, Workspace};
 
 mod mount;
 
@@ -18,8 +18,8 @@ struct NewEntrySet<'a> {
     accessed: crate::ExfatTimestamp,
 }
 
-impl<D: BlockDevice> FileSystem<D> {
-    fn file_cluster_at(
+impl<D: AsyncBlockDevice> FileSystem<D> {
+    async fn file_cluster_at(
         &mut self,
         file: &mut File,
         wanted: u64,
@@ -45,11 +45,24 @@ impl<D: BlockDevice> FileSystem<D> {
             return Err(Error::Corrupt);
         }
         while index < wanted {
-            cluster = self.next_cluster(cluster, scratch)?;
+            let previous = cluster;
+            cluster = self.next_cluster(previous, scratch).await?;
+            let next_index = index + 1;
             if !(2..cluster_count.saturating_add(2)).contains(&cluster) {
-                return Err(Error::Corrupt);
+                let fat_byte = u64::from(previous) * 4;
+                return Err(Error::FileChainInvalid {
+                    first_cluster: file.first_cluster,
+                    cluster_index: next_index,
+                    cluster: previous,
+                    next_cluster: cluster,
+                    fat_lba: self
+                        .volume
+                        .geometry
+                        .fat_lba_for_byte(fat_byte)
+                        .ok_or(Error::Corrupt)?,
+                });
             }
-            index += 1;
+            index = next_index;
         }
         file.cached_cluster_index = Some(wanted);
         file.cached_cluster = cluster;
@@ -59,19 +72,24 @@ impl<D: BlockDevice> FileSystem<D> {
     /// Open a regular file without tying the returned handle to this
     /// filesystem borrow.  Mutation support extends this handle with the
     /// directory-entry locator while retaining the same public shape.
-    pub fn open(&mut self, path: &str, scratch: &mut Scratch<'_>) -> Result<File, Error<D::Error>> {
+    pub async fn open(
+        &mut self,
+        path: &str,
+        scratch: &mut Scratch<'_>,
+    ) -> Result<File, Error<D::Error>> {
         let mut workspace = Workspace::new();
         self.open_with_workspace(path, scratch, &mut workspace)
+            .await
     }
 
     /// Open a regular file using caller-owned path and entry-set storage.
-    pub fn open_with_workspace(
+    pub async fn open_with_workspace(
         &mut self,
         path: &str,
         scratch: &mut Scratch<'_>,
         workspace: &mut Workspace,
     ) -> Result<File, Error<D::Error>> {
-        let entry = self.lookup_with_workspace(path, scratch, workspace)?;
+        let entry = self.lookup_with_workspace(path, scratch, workspace).await?;
         if entry.is_directory {
             return Err(Error::IsDirectory);
         }
@@ -92,7 +110,7 @@ impl<D: BlockDevice> FileSystem<D> {
 
     /// Read sequentially from a detached file handle.  The handle never
     /// borrows this filesystem; callers may keep it in a long-lived worker.
-    pub fn read(
+    pub async fn read(
         &mut self,
         file: &mut File,
         mut out: &mut [u8],
@@ -109,12 +127,13 @@ impl<D: BlockDevice> FileSystem<D> {
         while done < wanted {
             let offset = file.position;
             let cluster_index = offset / cluster_bytes;
-            let cluster = self.file_cluster_at(file, cluster_index, scratch)?;
+            let cluster = self.file_cluster_at(file, cluster_index, scratch).await?;
             let within = offset % cluster_bytes;
             let lba = g.cluster_lba(cluster).ok_or(Error::Corrupt)? + within / sector_size as u64;
             let sector_offset = within as usize % sector_size;
             self.device
                 .read_sector(lba, scratch.sector(sector_size))
+                .await
                 .map_err(Error::Device)?;
             let count = ::core::cmp::min(sector_size - sector_offset, wanted - done);
             out[..count].copy_from_slice(
@@ -130,7 +149,7 @@ impl<D: BlockDevice> FileSystem<D> {
     /// Write within the file's already allocated valid range.  Growth is
     /// deliberately handled by `append`/`truncate` so a failed metadata
     /// commit can never leave a newly visible uninitialised range.
-    pub fn write(
+    pub async fn write(
         &mut self,
         file: &mut File,
         mut input: &[u8],
@@ -148,7 +167,7 @@ impl<D: BlockDevice> FileSystem<D> {
         while done < wanted {
             let offset = file.position;
             let index = offset / cluster_bytes;
-            let cluster = self.file_cluster_at(file, index, scratch)?;
+            let cluster = self.file_cluster_at(file, index, scratch).await?;
             let within = offset % cluster_bytes;
             let lba = g.cluster_lba(cluster).ok_or(Error::Corrupt)? + within / sector_size as u64;
             let sector_offset = within as usize % sector_size;
@@ -156,12 +175,14 @@ impl<D: BlockDevice> FileSystem<D> {
             if sector_offset != 0 || count != sector_size {
                 self.device
                     .read_sector(lba, scratch.sector(sector_size))
+                    .await
                     .map_err(Error::Device)?;
             }
             scratch.sector(sector_size)[sector_offset..sector_offset + count]
                 .copy_from_slice(&input[..count]);
             self.device
                 .write_sector(lba, scratch.sector(sector_size))
+                .await
                 .map_err(Error::Device)?;
             file.position += count as u64;
             done += count;
@@ -173,20 +194,21 @@ impl<D: BlockDevice> FileSystem<D> {
     /// Commit all preceding sector writes to the block device.  `Scratch` is
     /// accepted to keep the mutating API uniform and leaves room for a future
     /// volume-flags update without changing callers.
-    pub fn flush(&mut self, _scratch: &mut Scratch<'_>) -> Result<(), Error<D::Error>> {
-        self.device.flush().map_err(Error::Device)
+    pub async fn flush(&mut self, _scratch: &mut Scratch<'_>) -> Result<(), Error<D::Error>> {
+        self.device.flush().await.map_err(Error::Device)
     }
 
     /// Create a regular file in the root directory.  Nested creation is built
     /// on the same directory-entry writer once directory growth is enabled.
     #[inline(never)]
-    pub fn create(
+    pub async fn create(
         &mut self,
         path: &str,
         scratch: &mut Scratch<'_>,
     ) -> Result<File, Error<D::Error>> {
         let mut workspace = Workspace::new();
         self.create_with_workspace(path, scratch, &mut workspace)
+            .await
     }
 
     /// Create or truncate a regular file using caller-owned path workspace.
@@ -195,7 +217,7 @@ impl<D: BlockDevice> FileSystem<D> {
     /// in static storage; it avoids allocating the UTF-16 filename conversion
     /// buffer in the caller's stack frame.
     #[inline(never)]
-    pub fn create_with_workspace(
+    pub async fn create_with_workspace(
         &mut self,
         path: &str,
         scratch: &mut Scratch<'_>,
@@ -207,14 +229,16 @@ impl<D: BlockDevice> FileSystem<D> {
         }
         let (parent, name) = match path.rsplit_once('/') {
             Some((parent_path, name)) => {
-                let entry = self.lookup_with_workspace(parent_path, scratch, workspace)?;
+                let entry = self
+                    .lookup_with_workspace(parent_path, scratch, workspace)
+                    .await?;
                 (entry.directory().ok_or(Error::NotDirectory)?, name)
             }
             None => (Directory::root(self.volume.geometry), path),
         };
-        match self.open_with_workspace(path, scratch, workspace) {
+        match self.open_with_workspace(path, scratch, workspace).await {
             Ok(mut file) => {
-                self.truncate(&mut file, 0, scratch)?;
+                self.truncate(&mut file, 0, scratch).await?;
                 return Ok(file);
             }
             Err(Error::PathNotFound) => {}
@@ -223,7 +247,9 @@ impl<D: BlockDevice> FileSystem<D> {
         let len = utf8_to_utf16(name, &mut workspace.utf16)?;
         let names = len.div_ceil(15);
         let entries = 2 + names;
-        let entry_locs = self.find_free_entries(parent, entries, scratch, workspace)?;
+        let entry_locs = self
+            .find_free_entries(parent, entries, scratch, workspace)
+            .await?;
         self.write_entry_set(
             &entry_locs[..entries],
             NewEntrySet {
@@ -237,7 +263,8 @@ impl<D: BlockDevice> FileSystem<D> {
                 accessed: crate::ExfatTimestamp::default(),
             },
             scratch,
-        )?;
+        )
+        .await?;
         Ok(File {
             primary: entry_locs[0],
             stream: entry_locs[1],
@@ -255,17 +282,18 @@ impl<D: BlockDevice> FileSystem<D> {
 
     /// Ensure every UTF-8 path component exists as an exFAT directory.
     #[inline(never)]
-    pub fn create_dir_all(
+    pub async fn create_dir_all(
         &mut self,
         path: &str,
         scratch: &mut Scratch<'_>,
     ) -> Result<(), Error<D::Error>> {
         let mut workspace = Workspace::new();
         self.create_dir_all_with_workspace(path, scratch, &mut workspace)
+            .await
     }
 
     /// Ensure every UTF-8 path component exists using caller-owned workspace.
-    pub fn create_dir_all_with_workspace(
+    pub async fn create_dir_all_with_workspace(
         &mut self,
         path: &str,
         scratch: &mut Scratch<'_>,
@@ -275,106 +303,133 @@ impl<D: BlockDevice> FileSystem<D> {
         if path.is_empty() {
             return Err(Error::InvalidPath);
         }
-        let (parent, name) = match path.rsplit_once('/') {
-            Some((parent_path, name)) => {
-                self.create_dir_all_with_workspace(parent_path, scratch, workspace)?;
-                let entry = self.lookup_with_workspace(parent_path, scratch, workspace)?;
-                (entry.directory().ok_or(Error::NotDirectory)?, name)
+        let mut parent = Directory::root(self.volume.geometry);
+        for name in path.split('/') {
+            if name.is_empty() {
+                continue;
             }
-            None => (Directory::root(self.volume.geometry), path),
-        };
-        match self.lookup_with_workspace(path, scratch, workspace) {
-            Ok(entry) if entry.is_directory => return Ok(()),
-            Ok(_) => return Err(Error::NotDirectory),
-            Err(Error::PathNotFound) => {}
-            Err(error) => return Err(error),
-        }
-        let len = utf8_to_utf16(name, &mut workspace.utf16)?;
-        let names = len.div_ceil(15);
-        let entries = 2 + names;
-        let entry_locs = self.find_free_entries(parent, entries, scratch, workspace)?;
-        let cluster = self.allocate_cluster(scratch)?;
-        let cluster_bytes = u64::from(self.volume.geometry.bytes_per_cluster());
-        self.write_entry_set(
-            &entry_locs[..entries],
-            NewEntrySet {
-                name: &workspace.utf16[..len],
-                attributes: 0x10,
+            let len = utf8_to_utf16(name, &mut workspace.utf16)?;
+            if let Some(entry) = self.find_child(parent, len, scratch, workspace).await? {
+                parent = entry.directory().ok_or(Error::NotDirectory)?;
+                continue;
+            }
+            let names = len.div_ceil(15);
+            let entries = 2 + names;
+            let entry_locs = self
+                .find_free_entries(parent, entries, scratch, workspace)
+                .await?;
+            let cluster = self.allocate_cluster(scratch).await?;
+            let cluster_bytes = u64::from(self.volume.geometry.bytes_per_cluster());
+            self.write_entry_set(
+                &entry_locs[..entries],
+                NewEntrySet {
+                    name: &workspace.utf16[..len],
+                    attributes: 0x10,
+                    first_cluster: cluster,
+                    data_length: cluster_bytes,
+                    no_fat_chain: false,
+                    created: crate::ExfatTimestamp::default(),
+                    modified: crate::ExfatTimestamp::default(),
+                    accessed: crate::ExfatTimestamp::default(),
+                },
+                scratch,
+            )
+            .await?;
+            parent = Directory {
                 first_cluster: cluster,
                 data_length: cluster_bytes,
                 no_fat_chain: false,
-                created: crate::ExfatTimestamp::default(),
-                modified: crate::ExfatTimestamp::default(),
-                accessed: crate::ExfatTimestamp::default(),
-            },
-            scratch,
-        )
+                primary: Some(entry_locs[0]),
+                stream: Some(entry_locs[1]),
+                entry_locs,
+                entry_count: entries as u8,
+            };
+        }
+        Ok(())
     }
 
-    /// Remove a file or directory tree and release all allocated clusters.
+    /// Remove a file or empty directory and release its allocated clusters.
     ///
-    /// Directories are removed depth-first, including all files and nested
-    /// directories they contain. Call [`Self::is_dir_empty`] first when an
-    /// application needs an empty-directory-only policy.
-    pub fn remove(&mut self, path: &str, scratch: &mut Scratch<'_>) -> Result<(), Error<D::Error>> {
+    /// Call [`Self::is_dir_empty`] before removing a directory. Recursive
+    /// deletion is deliberately left to a caller-owned traversal so async
+    /// operation does not introduce an unbounded future or hidden allocator.
+    pub async fn remove(
+        &mut self,
+        path: &str,
+        scratch: &mut Scratch<'_>,
+    ) -> Result<(), Error<D::Error>> {
         let mut workspace = Workspace::new();
         self.remove_with_workspace(path, scratch, &mut workspace)
+            .await
     }
 
     /// [`Self::remove`] using caller-owned path/entry workspace.
-    pub fn remove_with_workspace(
+    pub async fn remove_with_workspace(
         &mut self,
         path: &str,
         scratch: &mut Scratch<'_>,
         workspace: &mut Workspace,
     ) -> Result<(), Error<D::Error>> {
-        let entry = self.lookup_with_workspace(path.trim_matches('/'), scratch, workspace)?;
-        self.remove_entry_tree(entry, scratch)
+        let entry = self
+            .lookup_with_workspace(path.trim_matches('/'), scratch, workspace)
+            .await?;
+        self.remove_entry_tree(entry, scratch).await
     }
 
     /// Return whether `path` names an empty directory.
     ///
     /// This is a policy helper for callers that want to prompt before using
     /// [`Self::remove`]. Passing a regular file returns [`Error::NotDirectory`].
-    pub fn is_dir_empty(
+    pub async fn is_dir_empty(
         &mut self,
         path: &str,
         scratch: &mut Scratch<'_>,
     ) -> Result<bool, Error<D::Error>> {
         let mut workspace = Workspace::new();
         self.is_dir_empty_with_workspace(path, scratch, &mut workspace)
+            .await
     }
 
     /// [`Self::is_dir_empty`] using caller-owned path/entry workspace.
-    pub fn is_dir_empty_with_workspace(
+    pub async fn is_dir_empty_with_workspace(
         &mut self,
         path: &str,
         scratch: &mut Scratch<'_>,
         workspace: &mut Workspace,
     ) -> Result<bool, Error<D::Error>> {
-        let entry = self.lookup_with_workspace(path.trim_matches('/'), scratch, workspace)?;
+        let entry = self
+            .lookup_with_workspace(path.trim_matches('/'), scratch, workspace)
+            .await?;
         let directory = entry.directory().ok_or(Error::NotDirectory)?;
-        Ok(self.first_directory_entry(directory, scratch)?.is_none())
+        Ok(self
+            .first_directory_entry(directory, scratch)
+            .await?
+            .is_none())
     }
 
-    fn remove_entry_tree(
+    async fn remove_entry_tree(
         &mut self,
         entry: DirectoryEntry,
         scratch: &mut Scratch<'_>,
     ) -> Result<(), Error<D::Error>> {
         if let Some(directory) = entry.directory() {
-            // Delete one child at a time, then restart this directory's scan.
-            // That keeps traversal allocation-free and avoids retaining a
-            // sector-backed iterator while its child mutates the media.
-            while let Some(child) = self.first_directory_entry(directory, scratch)? {
-                self.remove_entry_tree(child, scratch)?;
+            // An async recursive traversal would require an unbounded boxed
+            // future. Keep this allocation-free primitive honest: callers may
+            // remove files and empty directories, while a future explicit
+            // caller-owned traversal stack can perform recursive deletion.
+            if self
+                .first_directory_entry(directory, scratch)
+                .await?
+                .is_some()
+            {
+                return Err(Error::DirectoryNotEmpty);
             }
         }
-        self.retire_entry_set(&entry, scratch)?;
-        self.release_entry_clusters(&entry, scratch)
+        self.retire_entry_set(&entry, scratch).await?;
+        self.release_entry_clusters(&entry, scratch).await
     }
 
-    fn first_directory_entry(
+    async fn first_directory_entry(
         &mut self,
         directory: Directory,
         scratch: &mut Scratch<'_>,
@@ -383,7 +438,8 @@ impl<D: BlockDevice> FileSystem<D> {
         self.read_directory(directory, scratch, |entry| {
             first = Some(entry.clone());
             false
-        })?;
+        })
+        .await?;
         Ok(first)
     }
 
@@ -392,7 +448,7 @@ impl<D: BlockDevice> FileSystem<D> {
     /// The operation preserves all stream metadata and timestamps. If the
     /// new name needs more directory slots, it writes a replacement entry set
     /// in the same parent before retiring the original one.
-    pub fn rename(
+    pub async fn rename(
         &mut self,
         path: &str,
         new_name: &str,
@@ -400,10 +456,11 @@ impl<D: BlockDevice> FileSystem<D> {
     ) -> Result<(), Error<D::Error>> {
         let mut workspace = Workspace::new();
         self.rename_with_workspace(path, new_name, scratch, &mut workspace)
+            .await
     }
 
     /// [`Self::rename`] using caller-owned workspace.
-    pub fn rename_with_workspace(
+    pub async fn rename_with_workspace(
         &mut self,
         path: &str,
         new_name: &str,
@@ -413,18 +470,23 @@ impl<D: BlockDevice> FileSystem<D> {
         if new_name.is_empty() || new_name.contains('/') {
             return Err(Error::InvalidPath);
         }
-        let entry = self.lookup_with_workspace(path.trim_matches('/'), scratch, workspace)?;
+        let entry = self
+            .lookup_with_workspace(path.trim_matches('/'), scratch, workspace)
+            .await?;
         let len = utf8_to_utf16(new_name, &mut workspace.utf16)?;
         let name_entries = len.div_ceil(15);
         if name_entries + 2 > usize::from(entry.entry_count) {
             let parent = match path.trim_matches('/').rsplit_once('/') {
                 Some((parent_path, _)) => self
-                    .lookup_with_workspace(parent_path, scratch, workspace)?
+                    .lookup_with_workspace(parent_path, scratch, workspace)
+                    .await?
                     .directory()
                     .ok_or(Error::NotDirectory)?,
                 None => Directory::root(self.volume.geometry),
             };
-            let locators = self.find_free_entries(parent, name_entries + 2, scratch, workspace)?;
+            let locators = self
+                .find_free_entries(parent, name_entries + 2, scratch, workspace)
+                .await?;
             self.write_entry_set(
                 &locators[..name_entries + 2],
                 NewEntrySet {
@@ -438,19 +500,24 @@ impl<D: BlockDevice> FileSystem<D> {
                     accessed: entry.accessed,
                 },
                 scratch,
-            )?;
-            return self.retire_entry_set(&entry, scratch);
+            )
+            .await?;
+            return self.retire_entry_set(&entry, scratch).await;
         }
-        let hash = self.upcase_name_hash(&workspace.utf16[..len], scratch)?;
+        let hash = self
+            .upcase_name_hash(&workspace.utf16[..len], scratch)
+            .await?;
         let size = usize::from(self.volume.geometry.bytes_per_sector);
         self.device
             .read_sector(entry.stream.lba, scratch.sector(size))
+            .await
             .map_err(Error::Device)?;
         let stream = usize::from(entry.stream.offset);
         scratch.sector(size)[stream + 3] = len as u8;
         scratch.sector(size)[stream + 4..stream + 6].copy_from_slice(&hash.to_le_bytes());
         self.device
             .write_sector(entry.stream.lba, scratch.sector(size))
+            .await
             .map_err(Error::Device)?;
         for (index, locator) in entry.entry_locs[2..usize::from(entry.entry_count)]
             .iter()
@@ -459,6 +526,7 @@ impl<D: BlockDevice> FileSystem<D> {
         {
             self.device
                 .read_sector(locator.lba, scratch.sector(size))
+                .await
                 .map_err(Error::Device)?;
             let offset = usize::from(locator.offset);
             let row = &mut scratch.sector(size)[offset..offset + 32];
@@ -474,13 +542,14 @@ impl<D: BlockDevice> FileSystem<D> {
             }
             self.device
                 .write_sector(locator.lba, scratch.sector(size))
+                .await
                 .map_err(Error::Device)?;
         }
-        self.recompute_entry_checksum(&entry, scratch)
+        self.recompute_entry_checksum(&entry, scratch).await
     }
 
     /// Append initialized bytes, allocating clusters and committing metadata.
-    pub fn append(
+    pub async fn append(
         &mut self,
         file: &mut File,
         input: &[u8],
@@ -523,18 +592,17 @@ impl<D: BlockDevice> FileSystem<D> {
                 ))
             } else {
                 let last_index = file.data_length.saturating_sub(1) / cluster_bytes;
-                Some(restore_on_err!(self.cluster_at(
-                    file.first_cluster,
-                    last_index,
-                    scratch
-                )))
+                Some(restore_on_err!(
+                    self.cluster_at(file.first_cluster, last_index, scratch)
+                        .await
+                ))
             };
             let preferred = if let Some(last) = last {
                 restore_on_err!(last.checked_add(1).ok_or(Error::NoSpace))
             } else {
                 2
             };
-            let new = restore_on_err!(self.allocate_cluster_preferred(preferred, scratch));
+            let new = restore_on_err!(self.allocate_cluster_preferred(preferred, scratch).await);
             if file.first_cluster == 0 {
                 file.first_cluster = new;
             } else if file.no_fat_chain && new == preferred {
@@ -548,20 +616,22 @@ impl<D: BlockDevice> FileSystem<D> {
                         let cluster = restore_on_err!(
                             file.first_cluster.checked_add(index).ok_or(Error::Corrupt)
                         );
-                        restore_on_err!(self.set_fat(
-                            cluster,
-                            restore_on_err!(cluster.checked_add(1).ok_or(Error::Corrupt)),
-                            scratch,
-                        ));
+                        restore_on_err!(
+                            self.set_fat(
+                                cluster,
+                                restore_on_err!(cluster.checked_add(1).ok_or(Error::Corrupt)),
+                                scratch,
+                            )
+                            .await
+                        );
                     }
                     file.no_fat_chain = false;
                     file.cached_cluster_index = None;
                 }
-                restore_on_err!(self.set_fat(
-                    restore_on_err!(last.ok_or(Error::Corrupt)),
-                    new,
-                    scratch,
-                ));
+                restore_on_err!(
+                    self.set_fat(restore_on_err!(last.ok_or(Error::Corrupt)), new, scratch,)
+                        .await
+                );
             }
             file.data_length = restore_on_err!(
                 file.data_length
@@ -572,19 +642,19 @@ impl<D: BlockDevice> FileSystem<D> {
         let old_len = file.valid_length;
         file.position = old_len;
         file.valid_length = end;
-        let written = restore_on_err!(self.write(file, input, scratch));
+        let written = restore_on_err!(self.write(file, input, scratch).await);
         if written != input.len() {
             *file = original;
             return Err(Error::Corrupt);
         }
-        restore_on_err!(self.update_stream(file, scratch));
+        restore_on_err!(self.update_stream(file, scratch).await);
         Ok(written)
     }
 
     /// Shorten a file and immediately return no-longer-needed clusters to the
     /// allocation bitmap. Growing through `truncate` is intentionally not
     /// supported; callers append initialized bytes instead.
-    pub fn truncate(
+    pub async fn truncate(
         &mut self,
         file: &mut File,
         len: u64,
@@ -611,10 +681,10 @@ impl<D: BlockDevice> FileSystem<D> {
                     let next = if file.no_fat_chain {
                         cluster.checked_add(1).ok_or(Error::Corrupt)?
                     } else {
-                        self.next_cluster(cluster, scratch)?
+                        self.next_cluster(cluster, scratch).await?
                     };
-                    self.set_fat(cluster, 0, scratch)?;
-                    self.set_bitmap(cluster, false, scratch)?;
+                    self.set_fat(cluster, 0, scratch).await?;
+                    self.set_bitmap(cluster, false, scratch).await?;
                     cluster = next;
                 }
                 file.first_cluster = 0;
@@ -625,22 +695,23 @@ impl<D: BlockDevice> FileSystem<D> {
                         .and_then(|cluster| cluster.checked_sub(1))
                         .ok_or(Error::Corrupt)?
                 } else {
-                    self.cluster_at(file.first_cluster, keep - 1, scratch)?
+                    self.cluster_at(file.first_cluster, keep - 1, scratch)
+                        .await?
                 };
                 let mut cluster = if file.no_fat_chain {
                     last.checked_add(1).ok_or(Error::Corrupt)?
                 } else {
-                    self.next_cluster(last, scratch)?
+                    self.next_cluster(last, scratch).await?
                 };
-                self.set_fat(last, 0xffff_ffff, scratch)?;
+                self.set_fat(last, 0xffff_ffff, scratch).await?;
                 for _ in keep..allocated {
                     let next = if file.no_fat_chain {
                         cluster.checked_add(1).ok_or(Error::Corrupt)?
                     } else {
-                        self.next_cluster(cluster, scratch)?
+                        self.next_cluster(cluster, scratch).await?
                     };
-                    self.set_fat(cluster, 0, scratch)?;
-                    self.set_bitmap(cluster, false, scratch)?;
+                    self.set_fat(cluster, 0, scratch).await?;
+                    self.set_bitmap(cluster, false, scratch).await?;
                     cluster = next;
                 }
             }
@@ -649,23 +720,24 @@ impl<D: BlockDevice> FileSystem<D> {
         }
         file.valid_length = len;
         file.position = ::core::cmp::min(file.position, len);
-        self.update_stream(file, scratch)
+        self.update_stream(file, scratch).await
     }
 
     /// Resolve an absolute or relative UTF-8 path without allocating.
     #[inline(never)]
-    pub fn lookup(
+    pub async fn lookup(
         &mut self,
         path: &str,
         scratch: &mut Scratch<'_>,
     ) -> Result<DirectoryEntry, Error<D::Error>> {
         let mut workspace = Workspace::new();
         self.lookup_with_workspace(path, scratch, &mut workspace)
+            .await
     }
 
     /// Resolve a UTF-8 path using caller-owned conversion and entry-set
     /// storage. Long-lived embedded tasks should use this form.
-    pub fn lookup_with_workspace(
+    pub async fn lookup_with_workspace(
         &mut self,
         path: &str,
         scratch: &mut Scratch<'_>,
@@ -680,7 +752,8 @@ impl<D: BlockDevice> FileSystem<D> {
         loop {
             let wanted_len = utf8_to_utf16(current, &mut workspace.utf16)?;
             let entry = self
-                .find_child(directory, wanted_len, scratch, workspace)?
+                .find_child(directory, wanted_len, scratch, workspace)
+                .await?
                 .ok_or(Error::PathNotFound)?;
             match segments.next() {
                 Some(next) => {
@@ -692,7 +765,7 @@ impl<D: BlockDevice> FileSystem<D> {
         }
     }
 
-    fn find_child(
+    async fn find_child(
         &mut self,
         directory: Directory,
         wanted_len: usize,
@@ -721,6 +794,7 @@ impl<D: BlockDevice> FileSystem<D> {
                 let lba = base + u64::from(sector);
                 self.device
                     .read_sector(lba, scratch.sector(size))
+                    .await
                     .map_err(Error::Device)?;
                 let usable = if directory.data_length == 0 {
                     size
@@ -741,11 +815,14 @@ impl<D: BlockDevice> FileSystem<D> {
                             offset: offset as u16,
                         },
                     )? {
-                        if self.names_match(
-                            entry.name_utf16(),
-                            &workspace.utf16[..wanted_len],
-                            scratch,
-                        )? {
+                        if self
+                            .names_match(
+                                entry.name_utf16(),
+                                &workspace.utf16[..wanted_len],
+                                scratch,
+                            )
+                            .await?
+                        {
                             return Ok(Some(entry));
                         }
                         // UpCase lookup used the one caller-owned sector
@@ -753,6 +830,7 @@ impl<D: BlockDevice> FileSystem<D> {
                         // next entry is inspected.
                         self.device
                             .read_sector(lba, scratch.sector(size))
+                            .await
                             .map_err(Error::Device)?;
                     }
                 }
@@ -763,7 +841,7 @@ impl<D: BlockDevice> FileSystem<D> {
             if directory.no_fat_chain {
                 return Ok(None);
             }
-            cluster = self.next_cluster(cluster, scratch)?;
+            cluster = self.next_cluster(cluster, scratch).await?;
             if cluster >= 0xffff_fff8 {
                 return Ok(None);
             }
@@ -773,7 +851,7 @@ impl<D: BlockDevice> FileSystem<D> {
         }
     }
 
-    fn names_match(
+    async fn names_match(
         &mut self,
         actual: &[u16],
         wanted: &[u16],
@@ -783,14 +861,14 @@ impl<D: BlockDevice> FileSystem<D> {
             return Ok(false);
         }
         for (&left, &right) in actual.iter().zip(wanted) {
-            if self.upcase_unit(left, scratch)? != self.upcase_unit(right, scratch)? {
+            if self.upcase_unit(left, scratch).await? != self.upcase_unit(right, scratch).await? {
                 return Ok(false);
             }
         }
         Ok(true)
     }
 
-    fn upcase_unit(
+    async fn upcase_unit(
         &mut self,
         unit: u16,
         scratch: &mut Scratch<'_>,
@@ -809,17 +887,20 @@ impl<D: BlockDevice> FileSystem<D> {
                 unit
             });
         }
+        if !self.volume.upcase_is_valid() {
+            return Err(Error::UpcaseTableCorrupt);
+        }
         let table = self.volume.upcase_table();
         let mut code = 0u32;
         let mut byte = 0u64;
         while byte + 2 <= table.byte_length {
-            let value = self.upcase_word(byte, scratch)?;
+            let value = self.upcase_word(byte, scratch).await?;
             byte += 2;
             if value == 0xffff {
                 if byte + 2 > table.byte_length {
                     return Err(Error::Corrupt);
                 }
-                let skipped = u32::from(self.upcase_word(byte, scratch)?);
+                let skipped = u32::from(self.upcase_word(byte, scratch).await?);
                 byte += 2;
                 let end = code.checked_add(skipped).ok_or(Error::Corrupt)?;
                 if (code..end).contains(&u32::from(unit)) {
@@ -836,7 +917,7 @@ impl<D: BlockDevice> FileSystem<D> {
         Err(Error::Corrupt)
     }
 
-    fn upcase_word(
+    async fn upcase_word(
         &mut self,
         byte: u64,
         scratch: &mut Scratch<'_>,
@@ -847,7 +928,9 @@ impl<D: BlockDevice> FileSystem<D> {
         }
         let geometry = self.volume.geometry;
         let bytes_per_cluster = u64::from(geometry.bytes_per_cluster());
-        let cluster = self.cluster_at(table.first_cluster, byte / bytes_per_cluster, scratch)?;
+        let cluster = self
+            .cluster_at(table.first_cluster, byte / bytes_per_cluster, scratch)
+            .await?;
         let within = byte % bytes_per_cluster;
         let size = usize::from(geometry.bytes_per_sector);
         let lba = geometry.cluster_lba(cluster).ok_or(Error::Corrupt)? + within / size as u64;
@@ -857,6 +940,7 @@ impl<D: BlockDevice> FileSystem<D> {
         }
         self.device
             .read_sector(lba, scratch.sector(size))
+            .await
             .map_err(Error::Device)?;
         Ok(u16::from_le_bytes(
             scratch.sector(size)[offset..offset + 2].try_into().unwrap(),
@@ -866,7 +950,7 @@ impl<D: BlockDevice> FileSystem<D> {
     /// Visit each allocated entry in the root directory.  Directory clusters
     /// are read one sector at a time, including on media whose cluster size is
     /// much larger than available RAM.
-    pub fn read_root<F>(
+    pub async fn read_root<F>(
         &mut self,
         scratch: &mut Scratch<'_>,
         visitor: F,
@@ -875,13 +959,13 @@ impl<D: BlockDevice> FileSystem<D> {
         F: FnMut(&DirectoryEntry) -> bool,
     {
         let root = Directory::root(self.volume.geometry);
-        self.read_directory(root, scratch, visitor)
+        self.read_directory(root, scratch, visitor).await
     }
 
     /// Stream complete allocated entry sets in `directory` to `visitor`.
     ///
     /// Returning `false` from the visitor stops iteration successfully.
-    pub fn read_directory<F>(
+    pub async fn read_directory<F>(
         &mut self,
         directory: Directory,
         scratch: &mut Scratch<'_>,
@@ -914,6 +998,7 @@ impl<D: BlockDevice> FileSystem<D> {
                         cluster_lba + u64::from(sector_in_cluster),
                         scratch.sector(sector_size),
                     )
+                    .await
                     .map_err(Error::Device)?;
                 let bytes = scratch.sector(sector_size);
                 let usable = if directory.data_length == 0 {
@@ -946,7 +1031,7 @@ impl<D: BlockDevice> FileSystem<D> {
                 cluster = cluster.checked_add(1).ok_or(Error::Corrupt)?;
                 continue;
             }
-            cluster = self.next_cluster(cluster, scratch)?;
+            cluster = self.next_cluster(cluster, scratch).await?;
             if cluster >= 0xffff_fff8 {
                 return Ok(());
             }
@@ -956,7 +1041,7 @@ impl<D: BlockDevice> FileSystem<D> {
         }
     }
 
-    pub(crate) fn next_cluster(
+    pub(crate) async fn next_cluster(
         &mut self,
         cluster: u32,
         scratch: &mut Scratch<'_>,
@@ -964,10 +1049,11 @@ impl<D: BlockDevice> FileSystem<D> {
         let g = self.volume.geometry;
         let sector_size = usize::from(g.bytes_per_sector);
         let fat_byte = u64::from(cluster) * 4;
-        let lba = g.partition.first_lba + u64::from(g.fat_offset) + fat_byte / sector_size as u64;
+        let lba = g.fat_lba_for_byte(fat_byte).ok_or(Error::Corrupt)?;
         let offset = (fat_byte as usize) % sector_size;
         self.device
             .read_sector(lba, scratch.sector(sector_size))
+            .await
             .map_err(Error::Device)?;
         Ok(u32::from_le_bytes(
             scratch.sector(sector_size)[offset..offset + 4]
@@ -976,7 +1062,7 @@ impl<D: BlockDevice> FileSystem<D> {
         ))
     }
 
-    fn write_entry_set(
+    async fn write_entry_set(
         &mut self,
         locators: &[EntryLocator],
         contents: NewEntrySet<'_>,
@@ -987,7 +1073,7 @@ impl<D: BlockDevice> FileSystem<D> {
         {
             return Err(Error::Corrupt);
         }
-        let name_hash = self.upcase_name_hash(contents.name, scratch)?;
+        let name_hash = self.upcase_name_hash(contents.name, scratch).await?;
         let size = usize::from(self.volume.geometry.bytes_per_sector);
         let mut checksum = 0u16;
         for (index, locator) in locators.iter().copied().enumerate() {
@@ -1036,38 +1122,42 @@ impl<D: BlockDevice> FileSystem<D> {
             }
             self.device
                 .read_sector(locator.lba, scratch.sector(size))
+                .await
                 .map_err(Error::Device)?;
             scratch.sector(size)[offset..offset + 32].copy_from_slice(&entry);
             self.device
                 .write_sector(locator.lba, scratch.sector(size))
+                .await
                 .map_err(Error::Device)?;
         }
         let primary = locators[0];
         self.device
             .read_sector(primary.lba, scratch.sector(size))
+            .await
             .map_err(Error::Device)?;
         let offset = usize::from(primary.offset);
         scratch.sector(size)[offset + 2..offset + 4].copy_from_slice(&checksum.to_le_bytes());
         self.device
             .write_sector(primary.lba, scratch.sector(size))
+            .await
             .map_err(Error::Device)
     }
 
-    fn upcase_name_hash(
+    async fn upcase_name_hash(
         &mut self,
         name: &[u16],
         scratch: &mut Scratch<'_>,
     ) -> Result<u16, Error<D::Error>> {
         let mut sum = 0u16;
         for unit in name.iter().copied() {
-            for byte in self.upcase_unit(unit, scratch)?.to_le_bytes() {
+            for byte in self.upcase_unit(unit, scratch).await?.to_le_bytes() {
                 sum = sum.rotate_right(1).wrapping_add(u16::from(byte));
             }
         }
         Ok(sum)
     }
 
-    fn find_free_entries(
+    async fn find_free_entries(
         &mut self,
         mut directory: Directory,
         wanted: usize,
@@ -1099,6 +1189,7 @@ impl<D: BlockDevice> FileSystem<D> {
                     let lba = base + u64::from(sector);
                     self.device
                         .read_sector(lba, scratch.sector(size))
+                        .await
                         .map_err(Error::Device)?;
                     let slots = if directory.data_length == 0 {
                         size / 32
@@ -1128,7 +1219,7 @@ impl<D: BlockDevice> FileSystem<D> {
                 if directory.no_fat_chain {
                     return Err(Error::NoSpace);
                 }
-                let next = self.next_cluster(cluster, scratch)?;
+                let next = self.next_cluster(cluster, scratch).await?;
                 if next < 0xffff_fff8 {
                     if next < 2 {
                         return Err(Error::Corrupt);
@@ -1140,14 +1231,17 @@ impl<D: BlockDevice> FileSystem<D> {
                 // Commit in media order: zeroed cluster, allocation metadata,
                 // then directory metadata.  If the final metadata write
                 // fails, the old end marker still hides the linked cluster.
-                let new = self.allocate_cluster_preferred(
-                    cluster.checked_add(1).ok_or(Error::NoSpace)?,
-                    scratch,
-                )?;
-                self.set_fat(cluster, new, scratch)?;
+                let new = self
+                    .allocate_cluster_preferred(
+                        cluster.checked_add(1).ok_or(Error::NoSpace)?,
+                        scratch,
+                    )
+                    .await?;
+                self.set_fat(cluster, new, scratch).await?;
                 let last_lba = base + u64::from(g.sectors_per_cluster - 1);
                 self.device
                     .read_sector(last_lba, scratch.sector(size))
+                    .await
                     .map_err(Error::Device)?;
                 for entry in scratch.sector(size).chunks_exact_mut(32) {
                     if entry[0] == 0 {
@@ -1156,6 +1250,7 @@ impl<D: BlockDevice> FileSystem<D> {
                 }
                 self.device
                     .write_sector(last_lba, scratch.sector(size))
+                    .await
                     .map_err(Error::Device)?;
                 if directory.data_length != 0 {
                     directory.data_length = directory
@@ -1175,7 +1270,7 @@ impl<D: BlockDevice> FileSystem<D> {
                         cached_cluster_index: None,
                         cached_cluster: 0,
                     };
-                    self.update_stream(&meta, scratch)?;
+                    self.update_stream(&meta, scratch).await?;
                 }
                 // A long entry set may begin in the old tail sector and end
                 // in this new cluster.  Its old zero entries were retired
@@ -1199,7 +1294,7 @@ impl<D: BlockDevice> FileSystem<D> {
         }
     }
 
-    fn retire_entry_set(
+    async fn retire_entry_set(
         &mut self,
         entry: &DirectoryEntry,
         scratch: &mut Scratch<'_>,
@@ -1215,6 +1310,7 @@ impl<D: BlockDevice> FileSystem<D> {
             }
             self.device
                 .read_sector(locator.lba, scratch.sector(size))
+                .await
                 .map_err(Error::Device)?;
             // Clearing the in-use bit is the exFAT deletion marker. Preserve
             // the remainder for media recovery tools while making the slots
@@ -1222,12 +1318,13 @@ impl<D: BlockDevice> FileSystem<D> {
             scratch.sector(size)[offset] &= !0x80;
             self.device
                 .write_sector(locator.lba, scratch.sector(size))
+                .await
                 .map_err(Error::Device)?;
         }
         Ok(())
     }
 
-    fn recompute_entry_checksum(
+    async fn recompute_entry_checksum(
         &mut self,
         entry: &DirectoryEntry,
         scratch: &mut Scratch<'_>,
@@ -1241,6 +1338,7 @@ impl<D: BlockDevice> FileSystem<D> {
         {
             self.device
                 .read_sector(locator.lba, scratch.sector(size))
+                .await
                 .map_err(Error::Device)?;
             let offset = usize::from(locator.offset);
             checksum = entry_set_checksum_step(
@@ -1251,15 +1349,17 @@ impl<D: BlockDevice> FileSystem<D> {
         }
         self.device
             .read_sector(entry.primary.lba, scratch.sector(size))
+            .await
             .map_err(Error::Device)?;
         let offset = usize::from(entry.primary.offset);
         scratch.sector(size)[offset + 2..offset + 4].copy_from_slice(&checksum.to_le_bytes());
         self.device
             .write_sector(entry.primary.lba, scratch.sector(size))
+            .await
             .map_err(Error::Device)
     }
 
-    fn release_entry_clusters(
+    async fn release_entry_clusters(
         &mut self,
         entry: &DirectoryEntry,
         scratch: &mut Scratch<'_>,
@@ -1274,10 +1374,10 @@ impl<D: BlockDevice> FileSystem<D> {
             let next = if entry.no_fat_chain || index + 1 == clusters {
                 None
             } else {
-                Some(self.next_cluster(cluster, scratch)?)
+                Some(self.next_cluster(cluster, scratch).await?)
             };
-            self.set_fat(cluster, 0, scratch)?;
-            self.set_bitmap(cluster, false, scratch)?;
+            self.set_fat(cluster, 0, scratch).await?;
+            self.set_bitmap(cluster, false, scratch).await?;
             if let Some(next) = next {
                 if next < 2 || next >= self.volume.geometry.cluster_count.saturating_add(2) {
                     return Err(Error::Corrupt);
@@ -1288,7 +1388,7 @@ impl<D: BlockDevice> FileSystem<D> {
         Ok(())
     }
 
-    fn update_stream(
+    async fn update_stream(
         &mut self,
         file: &File,
         scratch: &mut Scratch<'_>,
@@ -1304,6 +1404,7 @@ impl<D: BlockDevice> FileSystem<D> {
         // the caller-owned sector scratch.
         self.device
             .read_sector(file.stream.lba, scratch.sector(size))
+            .await
             .map_err(Error::Device)?;
         let stream = file.stream.offset as usize;
         if stream + 32 > size {
@@ -1318,6 +1419,7 @@ impl<D: BlockDevice> FileSystem<D> {
         }
         self.device
             .write_sector(file.stream.lba, scratch.sector(size))
+            .await
             .map_err(Error::Device)?;
 
         let mut checksum = 0u16;
@@ -1332,6 +1434,7 @@ impl<D: BlockDevice> FileSystem<D> {
             }
             self.device
                 .read_sector(locator.lba, scratch.sector(size))
+                .await
                 .map_err(Error::Device)?;
             for (byte_index, byte) in scratch.sector(size)[offset..offset + 32]
                 .iter()
@@ -1347,6 +1450,7 @@ impl<D: BlockDevice> FileSystem<D> {
 
         self.device
             .read_sector(file.primary.lba, scratch.sector(size))
+            .await
             .map_err(Error::Device)?;
         let primary = usize::from(file.primary.offset);
         if primary + 32 > size {
@@ -1355,6 +1459,7 @@ impl<D: BlockDevice> FileSystem<D> {
         scratch.sector(size)[primary + 2..primary + 4].copy_from_slice(&checksum.to_le_bytes());
         self.device
             .write_sector(file.primary.lba, scratch.sector(size))
+            .await
             .map_err(Error::Device)
     }
 }

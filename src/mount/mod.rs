@@ -1,12 +1,16 @@
 //! Volume mounting and media discovery.
 
-use crate::{AllocationBitmap, BlockDevice, Error, Geometry, Partition, Scratch, UpCaseTable};
+use crate::{AllocationBitmap, AsyncBlockDevice, Error, Geometry, Partition, Scratch, UpCaseTable};
 
 /// Read-only metadata discovered while mounting an exFAT volume.
 pub struct Volume {
     pub(crate) geometry: Geometry,
     pub(crate) bitmap: AllocationBitmap,
     pub(crate) upcase: UpCaseTable,
+    // ASCII case folding never reads the on-volume UpCase table. Keep track
+    // of a deferred validation failure so non-ASCII operations can reject it
+    // instead of consuming a corrupt mapping.
+    pub(crate) upcase_valid: bool,
     pub(crate) label: VolumeLabel,
 }
 
@@ -42,13 +46,17 @@ impl Volume {
     pub fn upcase_table(&self) -> UpCaseTable {
         self.upcase
     }
+    /// Whether the complete on-volume UpCase table passed validation.
+    pub fn upcase_is_valid(&self) -> bool {
+        self.upcase_valid
+    }
     /// Optional volume label stored in the root directory.
     pub fn label(&self) -> VolumeLabel {
         self.label
     }
 
     /// Validate and discover an exFAT volume on `device`.
-    pub fn mount<D: BlockDevice>(
+    pub async fn mount<D: AsyncBlockDevice>(
         device: &mut D,
         scratch: &mut Scratch<'_>,
     ) -> Result<Self, Error<D::Error>> {
@@ -58,9 +66,10 @@ impl Volume {
             .map_err(|_| Error::InvalidSectorSize)?;
         device
             .read_sector(0, scratch.sector(size))
+            .await
             .map_err(Error::Device)?;
         let partition = if has_protective_mbr(scratch.sector(size)) {
-            gpt_partition(device, scratch, size)?
+            gpt_partition(device, scratch, size).await?
         } else {
             mbr_partition(scratch.sector(size))?
         };
@@ -69,30 +78,64 @@ impl Volume {
         {
             return Err(Error::InvalidPartitionTable);
         }
-        validate_boot_checksum(device, partition, scratch, size)?;
+        // exFAT keeps a complete backup boot region immediately after the
+        // primary one. A torn metadata write may leave the primary's checksum
+        // invalid while the backup remains intact; mount from that verified
+        // copy rather than treating a recoverable volume as unformatted.
+        let boot_offset = match validate_boot_checksum(device, partition, 0, scratch, size).await {
+            Ok(()) => 0,
+            Err(Error::InvalidBootSector) => {
+                validate_boot_checksum(device, partition, 12, scratch, size).await?;
+                12
+            }
+            Err(error) => return Err(error),
+        };
         device
-            .read_sector(partition.first_lba, scratch.sector(size))
+            .read_sector(partition.first_lba + boot_offset, scratch.sector(size))
+            .await
             .map_err(Error::Device)?;
-        let geometry = parse_boot(partition, scratch.sector(size), size)?;
-        let (bitmap, upcase, label) = discover_root_system_entries(device, geometry, scratch)?;
-        validate_upcase_table(device, geometry, upcase, scratch)?;
+        let geometry =
+            parse_boot(partition, scratch.sector(size), size).map_err(|error| match error {
+                Error::Corrupt => Error::BootGeometryCorrupt,
+                error => error,
+            })?;
+        let (bitmap, upcase, label) = discover_root_system_entries(device, geometry, scratch)
+            .await
+            .map_err(|error| match error {
+                Error::Corrupt => Error::RootDirectoryCorrupt,
+                error => error,
+            })?;
+        // ASCII has a fixed exFAT case mapping and does not consume this
+        // table. Defer an on-media table-validation failure so a removable
+        // volume with only that auxiliary metadata damaged can still service
+        // ASCII paths (for example, recorder CSV export). Device errors still
+        // fail the mount, and any non-ASCII lookup is rejected below.
+        let upcase_valid = match validate_upcase_table(device, geometry, upcase, scratch).await {
+            Ok(()) => true,
+            Err(Error::Device(error)) => return Err(Error::Device(error)),
+            Err(_) => false,
+        };
         Ok(Self {
             geometry,
             bitmap,
             upcase,
+            upcase_valid,
             label,
         })
     }
 }
 
-fn validate_upcase_table<D: BlockDevice>(
+async fn validate_upcase_table<D: AsyncBlockDevice>(
     device: &mut D,
     geometry: Geometry,
     table: UpCaseTable,
     scratch: &mut Scratch<'_>,
 ) -> Result<(), Error<D::Error>> {
     if table.first_cluster < 2 || table.byte_length == 0 {
-        return Err(Error::Corrupt);
+        return Err(Error::UpcaseDescriptorInvalid {
+            first_cluster: table.first_cluster,
+            byte_length: table.byte_length,
+        });
     }
     let sector_size = usize::from(geometry.bytes_per_sector);
     let mut remaining = table.byte_length;
@@ -111,6 +154,7 @@ fn validate_upcase_table<D: BlockDevice>(
             }
             device
                 .read_sector(lba + u64::from(sector), scratch.sector(sector_size))
+                .await
                 .map_err(Error::Device)?;
             let count = ::core::cmp::min(remaining, sector_size as u64) as usize;
             for byte in scratch.sector(sector_size)[..count].iter().copied() {
@@ -119,25 +163,39 @@ fn validate_upcase_table<D: BlockDevice>(
             remaining -= count as u64;
         }
         if remaining != 0 {
-            cluster = next_cluster_on(device, geometry, cluster, scratch)?;
+            let current_cluster = cluster;
+            let (next_cluster, fat_lba, raw) =
+                next_cluster_on(device, geometry, cluster, scratch).await?;
+            cluster = next_cluster;
             if !(2..geometry.cluster_count.saturating_add(2)).contains(&cluster) {
-                return Err(Error::Corrupt);
+                return Err(Error::UpcaseChainInvalid {
+                    cluster: current_cluster,
+                    next_cluster: cluster,
+                    fat_lba,
+                    raw,
+                });
             }
         }
     }
     if checksum != table.checksum {
-        return Err(Error::Corrupt);
+        return Err(Error::UpcaseChecksumMismatch {
+            expected: table.checksum,
+            actual: checksum,
+        });
     }
     Ok(())
 }
 
-fn discover_root_system_entries<D: BlockDevice>(
+async fn discover_root_system_entries<D: AsyncBlockDevice>(
     device: &mut D,
     geometry: Geometry,
     scratch: &mut Scratch<'_>,
 ) -> Result<(AllocationBitmap, UpCaseTable, VolumeLabel), Error<D::Error>> {
     let sector_size = usize::from(geometry.bytes_per_sector);
-    let mut bitmap = None;
+    // TexFAT has two allocation bitmaps.  The one selected by ActiveFat is
+    // the only bitmap that may be used with the active FAT; the other one is
+    // explicitly stale while a transaction is in progress.
+    let mut bitmaps = [None; 2];
     let mut upcase = None;
     let mut label = VolumeLabel::EMPTY;
     let mut cluster = geometry.root_cluster;
@@ -151,20 +209,37 @@ fn discover_root_system_entries<D: BlockDevice>(
         for sector in 0..geometry.sectors_per_cluster {
             device
                 .read_sector(lba + u64::from(sector), scratch.sector(sector_size))
+                .await
                 .map_err(Error::Device)?;
             for entry in scratch.sector(sector_size).chunks_exact(32) {
                 match entry[0] {
                     0x00 => {
-                        return bitmap
+                        if bitmaps[..usize::from(geometry.number_of_fats)]
+                            .iter()
+                            .any(Option::is_none)
+                        {
+                            return Err(Error::Corrupt);
+                        }
+                        return bitmaps[usize::from(geometry.active_fat)]
                             .zip(upcase)
                             .map(|(b, u)| (b, u, label))
                             .ok_or(Error::Corrupt);
                     }
-                    0x81 if entry[1] & 1 == 0 && bitmap.is_none() => {
-                        bitmap = Some(AllocationBitmap {
+                    0x81 => {
+                        if entry[1] & !1 != 0 {
+                            return Err(Error::Corrupt);
+                        }
+                        let identifier = usize::from(entry[1] & 1);
+                        if identifier >= usize::from(geometry.number_of_fats) {
+                            return Err(Error::Corrupt);
+                        }
+                        if bitmaps[identifier].is_some() {
+                            return Err(Error::Corrupt);
+                        }
+                        bitmaps[identifier] = Some(AllocationBitmap {
                             first_cluster: le_u32(&entry[20..24]),
                             byte_length: le_u64(&entry[24..32]),
-                        })
+                        });
                     }
                     0x82 if upcase.is_none() => {
                         upcase = Some(UpCaseTable {
@@ -186,51 +261,57 @@ fn discover_root_system_entries<D: BlockDevice>(
                     }
                     _ => {}
                 }
-                if let (Some(bitmap), Some(upcase)) = (bitmap, upcase) {
-                    return Ok((bitmap, upcase, label));
-                }
+                // Keep scanning until the end marker.  On a two-FAT volume
+                // both bitmap descriptors are mandatory, even when the
+                // currently active descriptor has already been found.
             }
         }
-        cluster = next_cluster_on(device, geometry, cluster, scratch)?;
+        let (next_cluster, _, _) = next_cluster_on(device, geometry, cluster, scratch).await?;
+        cluster = next_cluster;
         if cluster >= 0xffff_fff8 {
             return Err(Error::Corrupt);
         }
     }
 }
 
-fn next_cluster_on<D: BlockDevice>(
+async fn next_cluster_on<D: AsyncBlockDevice>(
     device: &mut D,
     geometry: Geometry,
     cluster: u32,
     scratch: &mut Scratch<'_>,
-) -> Result<u32, Error<D::Error>> {
+) -> Result<(u32, u64, [u8; 4]), Error<D::Error>> {
     let sector_size = usize::from(geometry.bytes_per_sector);
     let byte = u64::from(cluster) * 4;
-    let lba =
-        geometry.partition.first_lba + u64::from(geometry.fat_offset) + byte / sector_size as u64;
+    let lba = geometry.fat_lba_for_byte(byte).ok_or(Error::Corrupt)?;
     let offset = byte as usize % sector_size;
     device
         .read_sector(lba, scratch.sector(sector_size))
+        .await
         .map_err(Error::Device)?;
-    Ok(le_u32(&scratch.sector(sector_size)[offset..offset + 4]))
+    let raw: [u8; 4] = scratch.sector(sector_size)[offset..offset + 4]
+        .try_into()
+        .unwrap();
+    Ok((u32::from_le_bytes(raw), lba, raw))
 }
 
-fn validate_boot_checksum<D: BlockDevice>(
+async fn validate_boot_checksum<D: AsyncBlockDevice>(
     device: &mut D,
     partition: Partition,
+    boot_offset: u64,
     scratch: &mut Scratch<'_>,
     sector_size: usize,
 ) -> Result<(), Error<D::Error>> {
-    if partition.sector_count < 12 {
+    if partition.sector_count < boot_offset + 12 {
         return Err(Error::InvalidBootSector);
     }
     let mut checksum = 0u32;
     for sector_index in 0..11u64 {
         device
             .read_sector(
-                partition.first_lba + sector_index,
+                partition.first_lba + boot_offset + sector_index,
                 scratch.sector(sector_size),
             )
+            .await
             .map_err(Error::Device)?;
         for (offset, byte) in scratch.sector(sector_size).iter().copied().enumerate() {
             if sector_index == 0 && matches!(offset, 106 | 107 | 112) {
@@ -240,7 +321,11 @@ fn validate_boot_checksum<D: BlockDevice>(
         }
     }
     device
-        .read_sector(partition.first_lba + 11, scratch.sector(sector_size))
+        .read_sector(
+            partition.first_lba + boot_offset + 11,
+            scratch.sector(sector_size),
+        )
+        .await
         .map_err(Error::Device)?;
     if scratch
         .sector(sector_size)
@@ -285,7 +370,7 @@ fn has_protective_mbr(sector: &[u8]) -> bool {
             .any(|entry| entry[4] == 0xee)
 }
 
-fn gpt_partition<D: BlockDevice>(
+async fn gpt_partition<D: AsyncBlockDevice>(
     device: &mut D,
     scratch: &mut Scratch<'_>,
     sector_size: usize,
@@ -295,6 +380,7 @@ fn gpt_partition<D: BlockDevice>(
     }
     device
         .read_sector(1, scratch.sector(sector_size))
+        .await
         .map_err(Error::Device)?;
     let header = scratch.sector(sector_size);
     if &header[..8] != b"EFI PART" {
@@ -340,6 +426,7 @@ fn gpt_partition<D: BlockDevice>(
     for sector_index in 0..table_sectors {
         device
             .read_sector(entries_lba + sector_index, scratch.sector(sector_size))
+            .await
             .map_err(Error::Device)?;
         let data = scratch.sector(sector_size);
         let base = sector_index * sector_size as u64;
@@ -397,6 +484,15 @@ fn parse_boot<E>(
     if boot.len() < 512 || &boot[3..11] != b"EXFAT   " || boot[510] != 0x55 || boot[511] != 0xaa {
         return Err(Error::InvalidBootSector);
     }
+    if boot[..3] != [0xeb, 0x76, 0x90]
+        || boot[11..64].iter().any(|&byte| byte != 0)
+        || boot[113..120].iter().any(|&byte| byte != 0)
+        || boot[105] != 1
+        || boot[104] > 99
+        || !(boot[112] <= 100 || boot[112] == 0xff)
+    {
+        return Err(Error::Corrupt);
+    }
     let sector_shift = boot[108];
     let cluster_shift = boot[109];
     if !(9..=12).contains(&sector_shift) || sector_shift >= usize::BITS as u8 {
@@ -416,11 +512,38 @@ fn parse_boot<E>(
     let cluster_count = le_u32(&boot[92..96]);
     let root_cluster = le_u32(&boot[96..100]);
     let volume_length = le_u64(&boot[72..80]);
+    let number_of_fats = boot[110];
+    if !matches!(number_of_fats, 1 | 2) {
+        return Err(Error::Corrupt);
+    }
+    let active_fat = if number_of_fats == 2 {
+        (le_u16(&boot[106..108]) & 1) as u8
+    } else {
+        0
+    };
     if fat_offset == 0
         || fat_length == 0
         || cluster_count == 0
         || root_cluster < 2
         || root_cluster >= cluster_count.saturating_add(2)
+    {
+        return Err(Error::Corrupt);
+    }
+    let fat_end = u64::from(fat_offset)
+        .checked_add(
+            u64::from(fat_length)
+                .checked_mul(u64::from(number_of_fats))
+                .ok_or(Error::Corrupt)?,
+        )
+        .ok_or(Error::Corrupt)?;
+    let fat_bytes_required = u64::from(cluster_count)
+        .checked_add(2)
+        .and_then(|entries| entries.checked_mul(4))
+        .ok_or(Error::Corrupt)?;
+    let fat_sectors_required = fat_bytes_required.div_ceil(bytes_per_sector as u64);
+    if fat_offset < 24
+        || u64::from(fat_length) < fat_sectors_required
+        || fat_end > u64::from(cluster_heap_offset)
     {
         return Err(Error::Corrupt);
     }
@@ -436,6 +559,8 @@ fn parse_boot<E>(
         sectors_per_cluster,
         fat_offset,
         fat_length,
+        number_of_fats,
+        active_fat,
         cluster_heap_offset,
         cluster_count,
         root_cluster,
@@ -445,6 +570,9 @@ fn parse_boot<E>(
 const BASIC_DATA_GUID_LE: [u8; 16] = [
     0xa2, 0xa0, 0xd0, 0xeb, 0xe5, 0xb9, 0x33, 0x44, 0x87, 0xc0, 0x68, 0xb6, 0xb7, 0x26, 0x99, 0xc7,
 ];
+fn le_u16(bytes: &[u8]) -> u16 {
+    u16::from_le_bytes(bytes[..2].try_into().unwrap())
+}
 fn le_u32(bytes: &[u8]) -> u32 {
     u32::from_le_bytes(bytes[..4].try_into().unwrap())
 }
