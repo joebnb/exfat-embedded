@@ -1,7 +1,7 @@
 //! Destructive, allocation-free formatter for a single exFAT partition.
 //!
 //! The formatter creates one MBR basic-data partition spanning all available
-//! sectors after LBA 0. It is deliberately synchronous: callers must own the
+//! sectors after LBA 0. It is deliberately exclusive: callers must own the
 //! device exclusively and surface an explicit confirmation before invoking it.
 
 use crate::{AsyncBlockDevice, Error, Scratch};
@@ -191,8 +191,21 @@ async fn write_boot_region<D: AsyncBlockDevice>(
             out[109] = spc.trailing_zeros() as u8;
             out[110] = 1;
             out[111] = 0x80;
+            // The exFAT specification requires unused boot code bytes to be
+            // initialized to F4 rather than left as zero.  Some desktop
+            // implementations validate this even though our own boot parser
+            // does not execute boot code.
+            out[120..510].fill(0xf4);
+            out[510..512].copy_from_slice(&[0x55, 0xaa]);
+        } else if sector <= 8 {
+            // Extended boot sectors carry a 32-bit little-endian
+            // ExtendedBootSignature (AA550000h), not a normal MBR signature.
+            out[508..512].copy_from_slice(&[0x00, 0x00, 0x55, 0xaa]);
         }
-        out[510..512].copy_from_slice(&[0x55, 0xaa]);
+        // Sectors 9 and 10 are, respectively, OEM Parameters and Reserved.
+        // With no OEM parameters they must remain entirely zero (a sequence
+        // of Null Parameters); writing 55 AA into either violates the on-disk
+        // format and is rejected by stricter host implementations.
         for (index, byte) in out.iter().copied().enumerate() {
             if sector != 0 || !matches!(index, 106 | 107 | 112) {
                 checksum = checksum.rotate_right(1).wrapping_add(u32::from(byte));
@@ -231,36 +244,48 @@ async fn write_fat<D: AsyncBlockDevice>(
     upcase: u32,
     upcase_len: u32,
 ) -> Result<(), Error<D::Error>> {
-    for sector in 0..fat_len {
-        let out = scratch.sector(512);
-        out.fill(0);
-        for index in 0..128u32 {
-            let cluster = sector * 128 + index;
-            let value = if cluster == 0 {
-                0xffff_fff8
-            } else if cluster == 1 || cluster == 2 {
-                EOC
-            } else if (bitmap..bitmap + bitmap_len).contains(&cluster) {
-                if cluster + 1 < bitmap + bitmap_len {
-                    cluster + 1
-                } else {
+    let batch_sectors = (scratch.len() / 512).max(1) as u32;
+    let mut first_sector = 0u32;
+    while first_sector < fat_len {
+        let count = (fat_len - first_sector).min(batch_sectors);
+        let out = scratch.sectors(512);
+        for offset in 0..count {
+            let sector = first_sector + offset;
+            let data = &mut out[offset as usize * 512..(offset as usize + 1) * 512];
+            data.fill(0);
+            for index in 0..128u32 {
+                let cluster = sector * 128 + index;
+                let value = if cluster == 0 {
+                    0xffff_fff8
+                } else if cluster == 1 || cluster == 2 {
                     EOC
-                }
-            } else if (upcase..upcase + upcase_len).contains(&cluster) {
-                if cluster + 1 < upcase + upcase_len {
-                    cluster + 1
+                } else if (bitmap..bitmap + bitmap_len).contains(&cluster) {
+                    if cluster + 1 < bitmap + bitmap_len {
+                        cluster + 1
+                    } else {
+                        EOC
+                    }
+                } else if (upcase..upcase + upcase_len).contains(&cluster) {
+                    if cluster + 1 < upcase + upcase_len {
+                        cluster + 1
+                    } else {
+                        EOC
+                    }
                 } else {
-                    EOC
-                }
-            } else {
-                0
-            };
-            out[index as usize * 4..index as usize * 4 + 4].copy_from_slice(&value.to_le_bytes());
+                    0
+                };
+                data[index as usize * 4..index as usize * 4 + 4]
+                    .copy_from_slice(&value.to_le_bytes());
+            }
         }
         device
-            .write_sector(part + u64::from(FAT_OFFSET + sector), out)
+            .write_sectors(
+                part + u64::from(FAT_OFFSET + first_sector),
+                &out[..count as usize * 512],
+            )
             .await
             .map_err(Error::Device)?;
+        first_sector += count;
     }
     let _ = (heap, spc);
     Ok(())
@@ -281,18 +306,23 @@ async fn write_bitmap<D: AsyncBlockDevice>(
 ) -> Result<(), Error<D::Error>> {
     let mut left = bytes;
     let mut lba = cluster_lba(part, heap, spc, cluster);
+    let first_lba = lba;
     while left > 0 {
-        let out = scratch.sector(512);
-        out.fill(0);
-        let n = core::cmp::min(left, 512) as usize;
-        if lba == cluster_lba(part, heap, spc, cluster) {
+        let count = core::cmp::min(left.div_ceil(512), (scratch.len() / 512) as u64) as usize;
+        let out = scratch.sectors(512);
+        out[..count * 512].fill(0);
+        if lba == first_lba {
             for bit in 0..reserved {
                 out[(bit / 8) as usize] |= 1 << (bit % 8);
             }
         }
-        device.write_sector(lba, out).await.map_err(Error::Device)?;
-        left -= n as u64;
-        lba += 1;
+        device
+            .write_sectors(lba, &out[..count * 512])
+            .await
+            .map_err(Error::Device)?;
+        let written = core::cmp::min(left, (count * 512) as u64);
+        left -= written;
+        lba += count as u64;
     }
     Ok(())
 }
@@ -308,8 +338,9 @@ async fn write_upcase<D: AsyncBlockDevice>(
     let mut code = 0u32;
     let mut lba = cluster_lba(part, heap, spc, cluster);
     while code < 65536 {
-        let out = scratch.sector(512);
-        for word in out.chunks_exact_mut(2) {
+        let count = core::cmp::min(65536 - code, (scratch.len() / 2) as u32);
+        let out = scratch.sectors(512);
+        for word in out[..count as usize * 2].chunks_exact_mut(2) {
             let c = code as u16;
             let v = if (u16::from(b'a')..=u16::from(b'z')).contains(&c) {
                 c - u16::from(b'a') + u16::from(b'A')
@@ -322,8 +353,11 @@ async fn write_upcase<D: AsyncBlockDevice>(
             }
             code += 1;
         }
-        device.write_sector(lba, out).await.map_err(Error::Device)?;
-        lba += 1;
+        device
+            .write_sectors(lba, &out[..count as usize * 2])
+            .await
+            .map_err(Error::Device)?;
+        lba += (count as usize * 2 / 512) as u64;
     }
     Ok(sum)
 }
