@@ -192,10 +192,12 @@ async fn discover_root_system_entries<D: AsyncBlockDevice>(
     scratch: &mut Scratch<'_>,
 ) -> Result<(AllocationBitmap, UpCaseTable, VolumeLabel), Error<D::Error>> {
     let sector_size = usize::from(geometry.bytes_per_sector);
-    // TexFAT has two allocation bitmaps.  The one selected by ActiveFat is
-    // the only bitmap that may be used with the active FAT; the other one is
-    // explicitly stale while a transaction is in progress.
-    let mut bitmaps = [None; 2];
+    // A volume may advertise two FATs while exposing only the allocation
+    // bitmap selected by ActiveFat.  Requiring descriptors for every FAT
+    // rejects such otherwise mountable removable media before the active
+    // bitmap can be used.  Only retain and validate the descriptor selected
+    // by this volume's active FAT.
+    let mut bitmap = None;
     let mut upcase = None;
     let mut label = VolumeLabel::EMPTY;
     let mut cluster = geometry.root_cluster;
@@ -214,13 +216,7 @@ async fn discover_root_system_entries<D: AsyncBlockDevice>(
             for entry in scratch.sector(sector_size).chunks_exact(32) {
                 match entry[0] {
                     0x00 => {
-                        if bitmaps[..usize::from(geometry.number_of_fats)]
-                            .iter()
-                            .any(Option::is_none)
-                        {
-                            return Err(Error::Corrupt);
-                        }
-                        return bitmaps[usize::from(geometry.active_fat)]
+                        return bitmap
                             .zip(upcase)
                             .map(|(b, u)| (b, u, label))
                             .ok_or(Error::Corrupt);
@@ -233,13 +229,15 @@ async fn discover_root_system_entries<D: AsyncBlockDevice>(
                         if identifier >= usize::from(geometry.number_of_fats) {
                             return Err(Error::Corrupt);
                         }
-                        if bitmaps[identifier].is_some() {
-                            return Err(Error::Corrupt);
+                        if identifier == usize::from(geometry.active_fat) {
+                            if bitmap.is_some() {
+                                return Err(Error::Corrupt);
+                            }
+                            bitmap = Some(AllocationBitmap {
+                                first_cluster: le_u32(&entry[20..24]),
+                                byte_length: le_u64(&entry[24..32]),
+                            });
                         }
-                        bitmaps[identifier] = Some(AllocationBitmap {
-                            first_cluster: le_u32(&entry[20..24]),
-                            byte_length: le_u64(&entry[24..32]),
-                        });
                     }
                     0x82 if upcase.is_none() => {
                         upcase = Some(UpCaseTable {
@@ -261,9 +259,8 @@ async fn discover_root_system_entries<D: AsyncBlockDevice>(
                     }
                     _ => {}
                 }
-                // Keep scanning until the end marker.  On a two-FAT volume
-                // both bitmap descriptors are mandatory, even when the
-                // currently active descriptor has already been found.
+                // Keep scanning until the end marker so the volume label is
+                // discovered even when it follows the system descriptors.
             }
         }
         let (next_cluster, _, _) = next_cluster_on(device, geometry, cluster, scratch).await?;
